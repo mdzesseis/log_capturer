@@ -1,0 +1,103 @@
+pipelines:
+  default:
+  - name: timestamp
+    pattern: '^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})'
+    type: field
+  - name: log_level
+    pattern: '\[(?P<level>INFO|WARNING|ERROR|CRITICAL)\]'
+    type: label
+
+  log_capturer:
+  - name: timestamp
+    pattern: '(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6})'
+    type: field
+  - name: source_tag
+    pattern: '\[(?P<source_tag>DOCKER|FILE)\]'
+    type: label
+  - name: log_level
+    pattern: 'level=(?P<level>[A-Z]+)'
+    type: label
+  - name: message
+    pattern: 'message=(?P<message>(?:[^"\\]|\\.)*)'
+    type: field
+  - name: work
+    pattern: 'work=\[(?P<worker>[\w-]+)\]'
+    type: field
+  - name: transaction
+    pattern: 'transaction_id=(?P<transaction_id>\d+)'
+    type: field
+  - name: event
+    pattern: 'event=(?P<event>\S+)'
+    type: field
+  - name: user
+    pattern: 'user=(?P<user>\S+)'
+    type: field
+
+  opensips:
+  - name: message_type
+    pattern: '(INVITE|BYE|REPLY):'
+    type: label
+  - name: call_id
+    pattern: 'call-id: (\S+)'
+    type: field
+  - name: sip_status
+    pattern: 'status=(\d+)'
+    type: field
+  - name: sip_method
+    pattern: 'method=(\w+)'
+    type: label
+
+  mysql:
+  - name: severity
+    pattern: '\[(ERROR|WARNING|NOTE)\]'
+    type: label
+  - name: error_code
+    pattern: '\[MY-(\d+)\]'
+    type: field
+  - name: mysql_component
+    pattern: '\[(Server)\]|\[(InnoDB)\]|\[(Repl)\]'
+    type: label
+
+  freeswitch:
+  - name: module
+    pattern: '\[(mod_\w+)\]'
+    type: label
+  - name: freeswitch_component
+    pattern: '\[(switch_\w+)\]'
+    type: label
+  - name: channel_action
+    pattern: '\((sofia/.+?)\)'
+    type: field
+
+  file_log_format:
+  - name: timestamp
+    pattern: '^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})'
+    type: field
+  - name: source_tag
+    pattern: '\[(?P<source_tag>FILE)\]'
+    type: label
+  - name: log_level
+    pattern: 'level=(?P<level>[A-Z]+)'
+    type: label
+  - name: app
+    pattern: 'app=(?P<app>\S+)'
+    type: label
+  - name: service
+    pattern: 'service=(?P<service>\S+)'
+    type: label
+  - name: user
+    pattern: 'user=(?P<user>\S+)'
+    type: field
+  - name: event
+    pattern: 'event=(?P<event>\S+)'
+    type: field
+
+source_mapping:
+  # Apply specific pipelines to sources
+  docker/opensips: opensips
+  docker/mysql: mysql
+  docker/freeswitch: freeswitch
+  # file:/var/log/opensips.log: opensips
+  docker/log_capturer: log_capturer
+  # Fallback for all docker containers
+  docker: default

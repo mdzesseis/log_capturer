@@ -1,0 +1,109 @@
+groups:
+- name: LogCapturerCriticalAlerts
+  rules:
+  - alert: LogCapturerDown
+    expr: up{job="log_capturer"} == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Log Capturer agent is down"
+      description: "The log-capturer instance {{ $labels.instance }} is down."
+
+  - alert: LogCapturerTasksHealthDegraded
+    expr: avg(log_capturer_task_health) < 0.7
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Log Capturer tasks health is degraded"
+      description: "Average task health is {{ $value | humanizePercentage }}, below threshold."
+
+  - alert: LogCapturerCircuitBreakerOpen
+    expr: log_capturer_circuit_breaker_state == 1
+    for: 2m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Circuit breaker is open"
+      description: "Circuit breaker {{ $labels.breaker_name }} is open, blocking requests."
+
+- name: LogCapturerResourceAlerts
+  rules:
+  - alert: LogCapturerSinkQueueHigh
+    expr: log_capturer_sink_queue_size{job="log_capturer"} > 4500 # 90% de 5000
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Log Capturer sink queue is almost full"
+      description: "The sink '{{ $labels.sink_name }}' has a queue size of {{ $value | humanize }} which is over 90% of capacity."
+
+  - alert: LogCapturerHighDiskBuffer
+    expr: log_capturer_sink_disk_buffer_size_bytes{job="log_capturer"} > 1073741824 # 1GB
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Log Capturer disk buffer is large"
+      description: "The sink '{{ $labels.sink_name }}' has a disk buffer size of {{ $value | humanize }} bytes."
+
+  - alert: LogCapturerHighMemoryUsage
+    expr: log_capturer_system_mem_bytes > 2147483648 # 2GB
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High memory usage"
+      description: "Memory usage is {{ $value | humanize1024 }}, above 2GB threshold."
+
+- name: LogCapturerTaskAlerts
+  rules:
+  - alert: LogCapturerTaskUnhealthy
+    expr: log_capturer_task_health == 0
+    for: 3m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Log Capturer task is unhealthy"
+      description: "Task {{ $labels.task_name }} is marked as unhealthy."
+
+  - alert: LogCapturerHighTaskRestarts
+    expr: increase(log_capturer_task_restarts_total[1h]) > 5
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High task restart rate"
+      description: "Task {{ $labels.task_name }} has restarted {{ $value }} times in the last hour."
+
+- name: LogCapturerPerformanceAlerts
+  rules:
+  - alert: LogCapturerHighProcessingTime
+    expr: rate(log_capturer_processing_time_seconds_sum[5m]) / rate(log_capturer_processing_time_seconds_count[5m]) > 1.0
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High log processing time"
+      description: "Average processing time for {{ $labels.source_type }}/{{ $labels.source_id }} is {{ $value | humanizeDuration }}."
+
+  - alert: LogCapturerHighThrottlingDelay
+    expr: rate(log_capturer_throttling_delay_seconds_sum[5m]) / rate(log_capturer_throttling_delay_seconds_count[5m]) > 2.0
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High throttling delays"
+      description: "Average throttling delay for {{ $labels.sink_name }} is {{ $value | humanizeDuration }}."
+
+- name: LogCapturerHTTPSessionAlerts
+  rules:
+  - alert: LogCapturerHTTPSessionPoolExhausted
+    expr: log_capturer_http_session_pool_available == 0
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "HTTP session pool exhausted"
+      description: "No HTTP sessions available in the pool, requests may be blocked."

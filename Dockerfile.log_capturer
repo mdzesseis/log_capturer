@@ -1,0 +1,65 @@
+# FROM python:3.11-slim
+
+# # Cria diretório de logs com permissões
+# RUN mkdir -p /logs && chown nobody:nogroup /logs
+
+# WORKDIR /app
+
+# # Instala dependências do sistema
+# RUN apt-get update && apt-get install -y \
+#     gcc \
+#     libffi-dev \
+#     && rm -rf /var/lib/apt/lists/*
+
+# # Copia arquivos necessários
+# COPY log_capturer_v10.py /app/main.py
+# COPY requirements.txt /app/
+
+# # Instala dependências Python
+# RUN pip install --no-cache-dir -r requirements.txt
+
+# # Cria usuário não-root
+# RUN useradd -m -u 1001 logcapturer
+
+# # Ajusta permissões
+# RUN chown -R logcapturer:logcapturer /app /logs
+
+# RUN chmod -R a+rw /var/log/test
+
+# USER logcapturer
+
+# CMD ["python", "main.py"]
+
+FROM python:3.11-slim
+
+# Cria diretório de logs com permissões
+RUN mkdir -p /logs && chown nobody:nogroup /logs
+RUN mkdir -p /var/log/test && chmod a+rw /var/log/test
+RUN mkdir -p /etc/log_capturer/ && chown nobody:nogroup /etc/log_capturer/
+
+WORKDIR /app
+
+# Instala dependências do sistema
+RUN apt-get update && apt-get install -y \
+    gcc \
+    libffi-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copia o pacote refatorado e requirements
+COPY refatoriong_new /app/refatoriong_new
+COPY requirements.txt /app/
+
+# Instala dependências Python
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Cria usuário não-root
+RUN useradd -m -u 1001 logcapturer
+
+# Ajusta permissões
+RUN chown -R logcapturer:logcapturer /app /logs /var/log/test /etc/log_capturer/
+
+USER logcapturer
+
+# Executa o pacote refatorado
+CMD ["python", "-m", "refatoriong_new"]

@@ -1,0 +1,42 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'log-capturer-cluster'
+
+rule_files:
+- /etc/prometheus/rules.yml
+
+alerting:
+  alertmanagers:
+  - static_configs:
+    - targets:
+      - alertmanager:9093
+
+scrape_configs:
+- job_name: 'prometheus'
+  static_configs:
+  - targets: [ 'localhost:9090' ]
+  scrape_interval: 30s
+
+- job_name: 'log_capturer'
+  static_configs:
+  - targets: [ 'log_capturer:8001' ]
+  scrape_interval: 10s
+  metrics_path: /metrics
+  # GRUPO 4: Métricas enterprise
+  metric_relabel_configs:
+  - source_labels: [ __name__ ]
+    regex: 'log_capturer_.*'
+    target_label: 'component'
+    replacement: 'log_capturer'
+
+- job_name: 'loki'
+  static_configs:
+  - targets: [ 'loki:3100' ]
+  scrape_interval: 30s
+
+- job_name: 'alertmanager'
+  static_configs:
+  - targets: [ 'alertmanager:9093' ]
+  scrape_interval: 30s

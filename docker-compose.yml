@@ -1,0 +1,249 @@
+version: '3.8'
+
+volumes:
+  loki-data:
+  grafana-data:
+  prometheus-data:
+  alertmanager-data:
+  agent-logs:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=536870912  # 512 MB em bytes
+  test-logs:
+
+services:
+  log_capturer:
+    build:
+      context: .
+      dockerfile: Dockerfile.log_capturer
+    container_name: log_capturer
+    restart: unless-stopped
+    ports:
+      - "8080:8080" # API Port
+      - "8001:8001" # Metrics Port
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - agent-logs:/logs
+      - test-logs:/var/log/test
+      - ./pipelines.yaml:/etc/log_capturer/pipelines.yaml:ro
+      - ./file_pipeline.yml:/etc/log_capturer/files.yaml:ro
+      # Novo: monta o pacote refatorado do host (dev-friendly)
+      - ./refatoriong_new:/app/refatoriong_new:ro
+    environment:
+      - DEBUG_MODE=false
+      - PYTHONUNBUFFERED=1
+      # --- General & API Config ---
+      - API_PORT=8080
+      - METRICS_PORT=8001
+      - LOG_CAPTURER_DIR=/logs
+      - FILES_CONFIG_PATH=/etc/log_capturer/files.yaml
+      # --- Docker ---
+      - DOCKER_CONNECTION_REQUIRED=false
+      - DOCKER_CONNECTION_TIMEOUT=10
+      - DOCKER_LABEL_FILTER_ENABLED=false
+      - DOCKER_LABEL_FILTER=monitoring
+      # Limite de concorrência do ContainerMonitor (semaforo)
+      - DOCKER_MAX_CONCURRENT_TAILS=50
+      # --- Task Management ---
+      - TASK_RESTART_ENABLED=true
+      - TASK_MAX_RESTART_COUNT=1000
+      - TASK_RESTART_BACKOFF_BASE=2
+      - TASK_HEALTH_CHECK_INTERVAL=240
+      - CIRCUIT_BREAKER_ENABLED=true
+      - CIRCUIT_BREAKER_FAILURE_THRESHOLD=500
+      - CIRCUIT_BREAKER_RECOVERY_TIMEOUT=510
+      # --- Resource Optimization ---
+      - HTTP_SESSION_POOL_SIZE=64
+      - HTTP_CONNECTION_TIMEOUT=240
+      - HTTP_REQUEST_TIMEOUT=240
+      - HTTP_CONNECTOR_LIMIT=256
+      - HTTP_CONNECTOR_LIMIT_PER_HOST=64
+      - BACKPRESSURE_THRESHOLD=0.9
+      - THROTTLE_SLEEP_BASE=0.1
+      - THROTTLE_SLEEP_MAX=5.0
+      - ADAPTIVE_THROTTLING_ENABLED=true
+      - FILE_IO_THREAD_POOL_SIZE=4
+      - BUFFER_WRITE_BATCH_SIZE=1000
+      - BUFFER_SYNC_INTERVAL=10.0
+      - CLEANUP_INTERVAL=300
+      - CLEANUP_BATCH_SIZE=100
+      - CLEANUP_AGE_THRESHOLD=3600
+      # --- Enterprise Robustness ---
+      - STRUCTURED_LOGGING_ENABLED=true
+      - STRUCTURED_LOG_FORMAT=json
+      - CORRELATION_ID_ENABLED=true
+      - CONFIG_VALIDATION_STRICT=false
+      - HEALTH_METRICS_ENABLED=true
+      - ADVANCED_HEALTH_CHECKS=true
+      - HEALTH_DEGRADED_THRESHOLD=0.3
+      - HEALTH_CRITICAL_THRESHOLD=0.7
+      - RETRY_JITTER_ENABLED=true
+      - RETRY_JITTER_MAX_MS=5000
+      # --- Processing & DLQ ---
+      - PROCESSING_ENABLED=true
+      - PROCESSING_WORKERS=4
+      - DLQ_ENABLED=true
+      - PIPELINE_CONFIG_FILE=/etc/log_capturer/pipelines.yaml
+      # --- Secrets Management ---
+      - SECRETS_MANAGER=env
+      # --- Robustez de timestamp ---
+      - TIMESTAMP_CLAMP_ENABLED=false
+      - TIMESTAMP_MAX_PAST_AGE_SECONDS=10800
+      - TIMESTAMP_MAX_FUTURE_AGE_SECONDS=60
+      - TIMESTAMP_CLAMP_DLQ=true
+      # --- Compressão ---
+      - SINK_HTTP_COMPRESSION_ALGO=gzip   # gzip (compatível com Loki) ou zstd (se suportado pelo endpoint)
+      - SINK_HTTP_COMPRESSION_LEVEL=4
+      - SINK_HTTP_COMPRESSION_MIN_BYTES=16384
+      - DISK_BUFFER_COMPRESSION_ALGO=zstd # zstd|lz4|gzip
+      - DISK_BUFFER_COMPRESSION_LEVEL=3
+      # --- Sinks Config ---
+      ## Loki
+      - LOKI_SINK_ENABLED=true
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+      - LOKI_SINK_QUEUE_SIZE=1000
+      - LOKI_BATCH_SIZE=1000
+      - LOKI_BATCH_TIMEOUT=15.0
+      - LOKI_BUFFER_DIR=/logs/loki_buffer
+      - LOKI_BUFFER_MAX_SIZE_MB=128
+      ## Local File
+      - LOCAL_SINK_ENABLED=true
+      - LOCAL_SINK_RETENTION_DAYS=1
+      - LOCAL_SINK_QUEUE_SIZE=5000
+      ## Elasticsearch (desativado)
+      - ELASTICSEARCH_SINK_ENABLED=false
+      ## Splunk (desativado)
+      - SPLUNK_SINK_ENABLED=false
+    depends_on:
+      loki:
+       condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    labels:
+      - 'monitoring=true'
+
+
+  loki:
+    image: grafana/loki:3.5.3
+    container_name: loki
+    # network_mode: host
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    restart: unless-stopped
+    healthcheck:
+      test: wget --quiet --tries=1 --output-document=- http://localhost:3100/ready | grep -q -w ready || exit 1
+      interval: 5s
+      timeout: 15s
+      retries: 35
+    labels:
+      - 'monitoring=true'
+  prometheus:
+    image: prom/prometheus:v2.46.0
+    container_name: prometheus
+    # network_mode: host
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./rules.yml:/etc/prometheus/rules.yml:ro
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+    depends_on:
+      - log_capturer
+      - alertmanager
+    labels:
+      - 'monitoring=true'
+
+  alertmanager:
+    image: prom/alertmanager:v0.25.0
+    container_name: alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/config.yml'
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./config.yml:/etc/alertmanager/config.yml:ro
+      - alertmanager-data:/alertmanager
+    labels:
+      - 'monitoring=true'
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    container_name: grafana
+    # network_mode: host
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./provisioning:/etc/grafana/provisioning
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    restart: unless-stopped
+    depends_on:
+      - loki
+      - prometheus
+    labels:
+      - 'monitoring=true'
+
+  log_generator_docker:
+    image: busybox:1.36
+    container_name: log_generator_docker
+    restart: always
+    command: sh -c 'while true; do echo "$(date +%Y-%m-%dT%H:%M:%S) [DOCKER] level=INFO app=docker_gen service=payment transaction_id=$RANDOM event=processed"; sleep 2; done'
+    labels:
+      - 'monitoring=true'
+
+  log_generator_file:
+    image: busybox:1.36
+    container_name: log_generator_file
+    restart: always
+    command: sh -c 'while true; do echo "$(date +%Y-%m-%dT%H:%M:%S) [FILE] level=WARN app=file_gen service=auth user=system event=failed_login" >> /var/log/test/test_app.log; sleep 3; done'
+    volumes:
+      - test-logs:/var/log/test
+    labels:
+      - 'monitoring=true'
+
+  # Elasticsearch (serviço comentado)
+  # elasticsearch:
+  #   image: docker.elastic.co/elasticsearch/elasticsearch:8.9.0
+  #   container_name: elasticsearch
+  #   environment:
+  #     - discovery.type=single-node
+  #     - ES_JAVA_OPTS=-Xms1g -Xmx1g
+  #     - xpack.security.enabled=false
+  #   volumes:
+  #     - elasticsearch-data:/usr/share/elasticsearch/data
+  #   ports:
+  #     - "9200:9200"
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:9200"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+  # Splunk (serviço comentado)
+  # splunk:
+  #   image: splunk/splunk:9.0.5
+  #   container_name: splunk
+  #   environment:
+  #     - SPLUNK_START_ARGS=--accept-license
+  #     - SPLUNK_PASSWORD=changeme
+  #     - SPLUNK_HEC_TOKEN=00000000-0000-0000-0000-000000000000
+  #   volumes:
+  #     - splunk-data:/opt/splunk/var
+  #   ports:
+  #     - "8000:8000"
+  #     - "8088:8088"

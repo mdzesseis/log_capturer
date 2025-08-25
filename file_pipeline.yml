@@ -1,0 +1,7 @@
+files:
+- path: /var/log/test/test_app.log
+  labels:
+    job: "test_app_static"
+    source: "file_system"
+    environment: "e2e-test"
+    pipeline: "file_log_format"
