@@ -1,0 +1,331 @@
+{
+  "id": null,
+  "uid": "log-capturer-refatorado",
+  "title": "Log Capturer Refatorado - Monitoramento",
+  "tags": ["log-capturer", "refatorado"],
+  "timezone": "browser",
+  "schemaVersion": 37,
+  "version": 1,
+  "refresh": "10s",
+  "style": "dark",
+  "editable": true,
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Linhas Processadas por Segundo",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "sum(rate(log_capturer_lines_processed_total[5m])) by (source_type,source_id,source_name)",
+          "legendFormat": "{{source_type}}/{{source_id}}/{{source_name}}",
+          "refId": "A"
+        }
+      ],
+      "description": "Quantidade de linhas processadas por segundo. Deve crescer continuamente. Valor baixo ou zero indica problema de ingestão.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "gauge",
+      "title": "Fila dos Sinks",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "log_capturer_sink_queue_size",
+          "legendFormat": "{{sink_name}}",
+          "refId": "A"
+        }
+      ],
+      "description": "Tamanho atual das filas dos sinks. Se próximo do máximo, pode indicar gargalo.",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Saúde das Tarefas",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "log_capturer_task_health",
+          "legendFormat": "{{task_name}}",
+          "refId": "A"
+        }
+      ],
+      "description": "Status de saúde das tarefas. 1 = saudável, 0 = problema.",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Bytes Processados por Fonte",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "sum(rate(log_capturer_bytes_processed_total[5m])) by (source_type,source_id,source_name)",
+          "legendFormat": "{{source_type}}/{{source_id}}/{{source_name}}",
+          "refId": "A"
+        }
+      ],
+      "description": "Total de bytes processados por fonte. Crescimento contínuo indica ingestão saudável.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Buffer em Disco dos Sinks",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "log_capturer_sink_disk_buffer_size_bytes",
+          "legendFormat": "{{sink_name}}",
+          "refId": "A"
+        }
+      ],
+      "description": "Bytes ocupados por buffers em disco dos sinks. Ideal: baixo.",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 8 }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Reinícios de Tarefas",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "increase(log_capturer_task_restarts_total[5m])",
+          "legendFormat": "{{task_name}}",
+          "refId": "A"
+        }
+      ],
+      "description": "Número de reinícios por tarefa. Valores altos podem indicar instabilidade.",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 8 }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Estado do Circuit Breaker",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "log_capturer_circuit_breaker_state",
+          "legendFormat": "{{breaker_name}}",
+          "refId": "A"
+        }
+      ],
+      "description": "Estado dos circuit breakers por sink. 0=Fechado (OK), 1=Aberto (Erro), 2=Half-Open (Teste).",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 16 }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Erros de Processamento & DLQ",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "increase(log_capturer_processing_errors_total[5m])",
+          "legendFormat": "Erros: {{source_id}}",
+          "refId": "A"
+        },
+        {
+          "expr": "increase(log_capturer_logs_dlq_total[5m])",
+          "legendFormat": "DLQ: {{reason}}",
+          "refId": "B"
+        }
+      ],
+      "description": "Total de erros de processamento e logs enviados para DLQ. Ideal: zero.",
+      "gridPos": { "h": 8, "w": 12, "x": 6, "y": 16 }
+    },
+    {
+      "id": 9,
+      "type": "logs",
+      "title": "Logs Coletados (Loki)",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "expr": "{job=~\"container_monitoring|file_monitoring|test_app_static\"}",
+          "refId": "A"
+        }
+      ],
+      "description": "Visualização dos logs coletados pelo agente.",
+      "gridPos": { "h": 16, "w": 24, "x": 0, "y": 24 },
+      "options": {
+        "showLabels": true,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      }
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Containers Monitorados",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "log_capturer_container_info",
+          "legendFormat": "{{container_name}} ({{image}})",
+          "refId": "A"
+        }
+      ],
+      "description": "Quantidade de containers monitorados e imagem.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 }
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Arquivos Monitorados",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "log_capturer_file_info",
+          "legendFormat": "{{filepath}}",
+          "refId": "A"
+        }
+      ],
+      "description": "Quantidade de arquivos monitorados e posição atual de leitura.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Uso de CPU (%)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "log_capturer_system_cpu_percent",
+          "legendFormat": "CPU",
+          "refId": "A"
+        }
+      ],
+      "description": "Uso de CPU do agente. Ideal: < 80%.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Uso de Memória do Container (bytes)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "log_capturer_container_mem_bytes",
+          "legendFormat": "Memória (container)",
+          "refId": "A"
+        }
+      ],
+      "description": "Uso de memória do container via cgroup. Condiz com 'docker stats'.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Uso de Disco (%)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "log_capturer_system_disk_usage",
+          "legendFormat": "{{mountpoint}}",
+          "refId": "A"
+        }
+      ],
+      "description": "Uso de disco por mountpoint. Ideal: < 80%.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 }
+    },
+    {
+      "id": 15,
+      "type": "stat",
+      "title": "Erros em Arquivos de Posição",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "increase(log_capturer_position_file_errors_total[5m])",
+          "legendFormat": "{{filepath}}/{{operation}}",
+          "refId": "A"
+        }
+      ],
+      "description": "Erros ao ler/gravar arquivos de posição. Ideal: zero.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 56 }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Latência de Envio aos Sinks (s)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "histogram_quantile(0.90, sum by (le, sink_name) (rate(log_capturer_sink_send_latency_seconds_bucket[$__rate_interval])))", "legendFormat": "{{sink_name}} p90", "refId": "A" },
+        { "expr": "sum by (sink_name) (rate(log_capturer_sink_send_latency_seconds_sum[$__rate_interval])) / sum by (sink_name) (rate(log_capturer_sink_send_latency_seconds_count[$__rate_interval]))", "legendFormat": "{{sink_name}} avg", "refId": "B" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 64 }
+    },
+    {
+      "id": 17,
+      "type": "stat",
+      "title": "HTTP Session Pool (Ativas / Disponíveis)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "log_capturer_http_session_pool_active", "legendFormat": "Ativas", "refId": "A" },
+        { "expr": "log_capturer_http_session_pool_available", "legendFormat": "Disponíveis", "refId": "B" }
+      ],
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 64 }
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Atrasos por Throttling (s)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "sum by (sink_name) (rate(log_capturer_throttling_delay_seconds_sum[$__rate_interval])) / sum by (sink_name) (rate(log_capturer_throttling_delay_seconds_count[$__rate_interval]))", "legendFormat": "{{sink_name}} avg", "refId": "A" }
+      ],
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 64 }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "CPU do Container (%)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "log_capturer_container_cpu_percent", "legendFormat": "CPU (%)", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent", "decimals": 2 }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 72 }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Memória do Container (%)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "log_capturer_container_mem_percent", "legendFormat": "Memória (%)", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent", "decimals": 2 }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 72 }
+    },
+    {
+      "id": 21,
+      "type": "stat",
+      "title": "Limite de Memória do Container (bytes)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "log_capturer_container_mem_limit_bytes", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 80 }
+    }
+  ],
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "label": "Prometheus",
+        "query": "prometheus",
+        "current": { "text": "Prometheus", "value": "prometheus" },
+        "hide": 0
+      }
+    ]
+  },
+  "annotations": { "list": [] }
+}

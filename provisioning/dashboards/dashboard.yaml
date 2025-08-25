@@ -1,0 +1,3 @@
+# Provider legado desativado para evitar duplicidade com dashboards.yml
+apiVersion: 1
+providers: []
