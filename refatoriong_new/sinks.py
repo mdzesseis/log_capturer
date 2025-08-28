@@ -5,6 +5,8 @@ import aiofiles
 import hashlib
 import gzip
 import shutil
+import asyncio
+import traceback
 from collections import deque
 from pathlib import Path
 from datetime import datetime
@@ -35,6 +37,15 @@ from .config import (
     SINK_HTTP_COMPRESSION_ADAPTIVE,
     # NOVO: DLQ por rejeição de timestamp no Loki
     TIMESTAMP_CLAMP_DLQ,
+    # NOVO: rotação do arquivo local por tamanho
+    LOCAL_SINK_MAX_FILE_SIZE_MB,
+    # NOVO: variável para habilitar persistência e recovery
+    SINK_PERSISTENCE_ENABLED,
+    SINK_PERSISTENCE_RECOVERY_MAX_RETRIES,
+    SINK_PERSISTENCE_RECOVERY_BACKOFF_BASE,
+    SINK_PERSISTENCE_RECOVERY_BACKOFF_MAX,
+    # NOVO: flag para permitir clamp automático de timestamps no sink (evitar NameError)
+    TIMESTAMP_CLAMP_ENABLED,
 )
 from .optimization import AdaptiveRateLimiter  # NOVO
 
@@ -43,6 +54,7 @@ class DiskQuotaManager:
         self.directory = directory
         self.max_size_bytes = max_size_bytes
         self.logger = StructuredLogger("disk_quota")
+    
     async def _dir_size(self) -> int:
         total = 0
         try:
@@ -52,6 +64,7 @@ class DiskQuotaManager:
         except Exception as e:
             self.logger.error("Erro ao calcular tamanho do diretório", error=str(e))
         return total
+    
     async def enforce_quota(self) -> int:
         try:
             size = await self._dir_size()
@@ -60,11 +73,11 @@ class DiskQuotaManager:
             target = int(self.max_size_bytes * 0.8)
             to_free = size - target
             freed = 0
+            removed_cnt = 0
             files = []
             for f in self.directory.rglob('*.jsonl'):
                 if f.is_file():
-                    st = f.stat()
-                    files.append((st.st_mtime, f, st.st_size))
+                    files.append((f.stat().st_mtime, f, f.stat().st_size))
             files.sort()
             for _, f, s in files:
                 if freed >= to_free:
@@ -72,10 +85,13 @@ class DiskQuotaManager:
                 try:
                     f.unlink()
                     freed += s
+                    removed_cnt += 1
                 except Exception as e:
-                    self.logger.error("Erro ao remover arquivo por cota", file=str(f), error=str(e))
+                    self.logger.warning(f"Não foi possível remover arquivo {f}", error=str(e))
             if freed:
                 metrics.CLEANUP_BYTES_FREED.inc(freed)
+            if removed_cnt:
+                metrics.CLEANUP_FILES_REMOVED.inc(removed_cnt)
             return freed
         except Exception:
             return 0
@@ -89,6 +105,7 @@ class AdaptiveBatcher:
         self.current_size = self.min_size
         self.recent_latencies = deque(maxlen=10)
         self.last_adjustment = time.time()
+    
     def adjust_batch_size(self, latency_seconds: float):
         self.recent_latencies.append(max(0.0, float(latency_seconds)))
         if time.time() - self.last_adjustment < 30 or not self.recent_latencies:
@@ -101,6 +118,7 @@ class AdaptiveBatcher:
         # CLAMP explícito com limites máximos definidos
         self.current_size = max(self.min_size, min(self.current_size, self.max_size, self.hard_max))
         self.last_adjustment = time.time()
+    
     def get_optimal_size(self) -> int:
         # Sempre retorna valor dentro dos limites
         return max(self.min_size, min(int(self.current_size), self.max_size, self.hard_max))
@@ -119,11 +137,37 @@ class AbstractSink:
         self.error_window = []
         self.retry_client = ExponentialBackoffRetry(max_retries=3)
         self.logger = StructuredLogger(f"sink_{name}")
+        
         # NOVO: cota por sink e limpeza proativa opcional
         self.disk_quota_manager = DiskQuotaManager(buffer_dir, max_buffer_size_mb * 1024 * 1024) if max_buffer_size_mb > 0 else None
         self._cleanup_task = None
+        
         # NOVO: contador de debug para amostragem em hot-path
         self._hp_dbg_counter = 0
+        
+        # NOVO: Sistema de persistência opcional controlado por variável de ambiente
+        self._persistence_enabled = SINK_PERSISTENCE_ENABLED
+        self._shutdown_event = asyncio.Event()
+        self.persistence_path = None
+        if self._persistence_enabled:
+            self.persistence_path = os.path.join(buffer_dir, f"{name}_persistence.json")
+            self.logger.info("Sistema de persistência habilitado", persistence_path=self.persistence_path)
+        
+        # NOVO: Métricas estendidas para observabilidade
+        self._stats = {
+            'batches_processed': 0,
+            'batches_failed': 0,
+            'logs_written': 0,
+            'logs_sent': 0,
+            'recovery_operations': 0,
+            'persistence_operations': 0
+        }
+        
+        self.logger.info("AbstractSink inicializado", 
+                        name=name, 
+                        persistence_enabled=self._persistence_enabled,
+                        buffer_dir=str(buffer_dir),
+                        max_buffer_size_mb=max_buffer_size_mb)
 
     def _is_self_batch(self, batch: List[Dict]) -> bool:
         if not SELF_FEEDBACK_GUARD:
@@ -144,16 +188,23 @@ class AbstractSink:
     async def start(self):
         from .optimization import unified_cleanup_manager
         self.logger.debug("Iniciando sink", name=self.name, buffer_dir=str(self.buffer_dir), max_buffer_size_mb=self.max_buffer_size_mb)
+        
         if self.max_buffer_size_mb > 0:
             unified_cleanup_manager.register_cleanup_target(self.buffer_dir, self.max_buffer_size_mb, ['*.jsonl','*.processing','*.tmp'])
+        
         if self.disk_quota_manager and PROACTIVE_CLEANUP_ENABLED:
             import asyncio
             self._cleanup_task = asyncio.create_task(self._proactive_cleanup_loop())
+        
         await self._register_tasks()
         self.logger.debug("Sink registrado no TaskManager", name=self.name)
 
     async def stop(self): 
         self.logger.debug("Parando sink", name=self.name)
+        
+        # NOVO: Sinalizar shutdown para worker loops
+        self._shutdown_event.set()
+        
         if self._cleanup_task:
             self._cleanup_task.cancel()
             try:
@@ -162,7 +213,11 @@ class AbstractSink:
                 pass
             except Exception:
                 pass
-        pass
+        
+        # NOVO: Log de estatísticas finais
+        self.logger.info("Estatísticas finais do sink", 
+                        name=self.name, 
+                        stats=self._stats)
 
     async def _proactive_cleanup_loop(self):
         while True:
@@ -233,7 +288,7 @@ class AbstractSink:
             algo = (algo or "zstd").lower()
             if algo in ("zstd", "zst"):
                 try:
-                    import zstandard as zstd
+                    import zstd
                     cctx = zstd.ZstdCompressor(level=int(level))
                     with open(src, "rb") as fin, open(dst, "wb") as fout, cctx.stream_writer(fout) as compressor:
                         shutil.copyfileobj(fin, compressor, length=1024 * 1024)
@@ -250,8 +305,7 @@ class AbstractSink:
                 except Exception:
                     pass
             # gzip como padrão/fallback
-            import gzip as _gzip
-            with open(src, "rb") as fin, _gzip.open(dst, "wb", compresslevel=int(level if level else 6)) as fout:
+            with open(src, "rb") as fin, gzip.open(dst, "wb", compresslevel=int(level if level else 6)) as fout:
                 shutil.copyfileobj(fin, fout, length=1024 * 1024)
 
         processed = 0
@@ -300,6 +354,10 @@ class AbstractSink:
         if hasattr(self, '_update_buffer_metric'):
             task_manager.register_task(f"{self.name}_metrics", self._update_buffer_metric, group=f"sink_{self.name}", priority=TaskPriority.LOW)
             await task_manager.start_task(f"{self.name}_metrics")
+        # Tarefa dedicada de recuperação de batches persistidos (não bloqueia o worker principal)
+        if self._persistence_enabled and hasattr(self, '_recovery_loop'):
+            task_manager.register_task(f"{self.name}_persistence_recovery", self._recovery_loop, group=f"sink_{self.name}", priority=TaskPriority.LOW)
+            await task_manager.start_task(f"{self.name}_persistence_recovery")
 
     async def _send_heartbeat(self):
         self.logger.debug("Enviando heartbeat do sink", name=self.name)
@@ -381,6 +439,16 @@ class AbstractSink:
         self.error_window = [t for t in self.error_window if t > cutoff]
         self.recent_errors = len(self.error_window)
 
+    async def _dir_size(self) -> int:
+        total = 0
+        try:
+            for p in self.buffer_dir.rglob('*'):
+                if p.is_file():
+                    total += p.stat().st_size
+        except Exception as e:
+            self.logger.warning("Erro ao calcular tamanho do diretório", error=str(e))
+        return total
+
     async def _read_from_disk_buffer(self) -> Optional[Dict[str, Any]]:
         self.logger.debug("Lendo batch do buffer em disco", name=self.name)
         try:
@@ -430,22 +498,142 @@ class AbstractSink:
             return None
 
     async def _update_buffer_metric(self):
-        import asyncio
-        while True:
+        while not self._shutdown_event.is_set():
             try:
-                self.logger.debug("Atualizando métrica de buffer em disco", name=self.name)
-                await self._send_heartbeat()
-                size = 0
-                for pattern in ('*.jsonl', '*.jsonl.gz', '*.jsonl.zst', '*.jsonl.lz4'):
-                    size += sum(f.stat().st_size for f in self.buffer_dir.glob(pattern) if f.is_file())
-                metrics.SINK_DISK_BUFFER_BYTES.labels(sink_name=self.name).set(size)
-            except Exception:
-                self.logger.debug("Erro ao atualizar métrica de buffer em disco", name=self.name)
+                dir_size = await self._dir_size()
+                metrics.SINK_DISK_BUFFER_BYTES.labels(sink_name=self.name).set(dir_size)
+                
+            except Exception as e:
+                self.logger.warning("Erro ao atualizar métrica de buffer", error=str(e))
+                
             await asyncio.sleep(30)
 
+    async def _remove_persistence(self):
+        """
+        Remove arquivo de persistência após sucesso no processamento.
+        """
+        if not self._persistence_enabled or not self.persistence_path:
+            return
+            
+        try:
+            if os.path.exists(self.persistence_path):
+                os.unlink(self.persistence_path)
+        except Exception as e:
+            self.logger.warning("Erro ao remover arquivo de persistência", 
+                              persistence_path=self.persistence_path,
+                              error=str(e))
+
+    # NOVO: Sistema de persistência para recovery após falhas
+    async def _load_persisted_batch(self) -> Optional[List[Dict]]:
+        """
+        Carrega batch persistido do disco para recovery.
+        Retorna None se não há batch persistido ou se persistência está desabilitada.
+        """
+        if not self._persistence_enabled or not self.persistence_path:
+            return None
+            
+        try:
+            if not os.path.exists(self.persistence_path):
+                return None
+                
+            async with aiofiles.open(self.persistence_path, 'r', encoding='utf-8') as f:
+                content = await f.read()
+                if not content.strip():
+                    return None
+                    
+            batch_data = json.loads(content)
+            if not batch_data or not isinstance(batch_data, list):
+                return None
+                
+            self._stats['recovery_operations'] += 1
+            self.logger.info("Batch recuperado da persistência", 
+                           batch_size=len(batch_data),
+                           persistence_path=self.persistence_path,
+                           recovery_count=self._stats['recovery_operations'])
+            
+            return batch_data
+            
+        except Exception as e:
+            self.logger.error("Erro ao carregar batch persistido", 
+                            persistence_path=self.persistence_path, 
+                            error=str(e))
+            # Remove arquivo corrompido
+            try:
+                if os.path.exists(self.persistence_path):
+                    os.remove(self.persistence_path)
+                    self.logger.warning("Arquivo de persistência corrompido removido")
+            except Exception:
+                pass
+            return None
+
+    async def _persist_batch(self, batch: List[Dict]):
+        """
+        Persiste batch no disco para recovery posterior.
+        Só opera se persistência estiver habilitada.
+        """
+        if not self._persistence_enabled or not self.persistence_path or not batch:
+            return
+            
+        try:
+            # Criar diretório se não existir
+            os.makedirs(os.path.dirname(self.persistence_path), exist_ok=True)
+            
+            # Escrever de forma atômica
+            temp_path = self.persistence_path + ".tmp"
+            async with aiofiles.open(temp_path, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps(batch))
+            
+            # Renomear para garantir atomicidade
+            os.rename(temp_path, self.persistence_path)
+            
+            self._stats['persistence_operations'] += 1
+            self.logger.debug("Batch persistido para recovery", 
+                            batch_size=len(batch),
+                            persistence_path=self.persistence_path,
+                            persistence_count=self._stats['persistence_operations'])
+            
+        except Exception as e:
+            self.logger.error("Erro ao persistir batch", 
+                            persistence_path=self.persistence_path, 
+                            batch_size=len(batch),
+                            error=str(e))
+            # Limpar arquivo temporário em caso de erro
+            try:
+                temp_path = self.persistence_path + ".tmp"
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+            except Exception:
+                pass
+
     async def send_batch(self, batch: List[Dict]) -> bool:
-        self.logger.debug("Enviando batch para destino", name=self.name, batch_size=len(batch))
-        raise NotImplementedError
+        """Envia batch para o destino - deve ser implementado pelas subclasses"""
+        raise NotImplementedError("send_batch deve ser implementado pelas subclasses")
+
+    async def _send_to_dlq(self, batch: List[Dict], reason: str):
+        """Grava registros rejeitados em DLQ em disco com o motivo."""
+        try:
+            dlq_path = str(BASE_DIR / "dlq" / f"{self.name}_rejected.log")
+            lines = []
+            for item in batch:
+                meta = dict(item.get("meta", {}))
+                meta["is_dlq"] = True
+                meta["dlq_reason"] = reason
+                meta["dlq_sink"] = self.name
+                entry = {
+                    "ts": item.get("ts"),
+                    "labels": item.get("labels"),
+                    "line": item.get("line"),
+                    "meta": meta
+                }
+                lines.append(json.dumps(entry) + "\n")
+                try:
+                    metrics.LOGS_DLQ.labels(source_type=meta.get("source_type", "unknown"), reason=reason).inc()
+                except Exception:
+                    pass
+            await optimized_file_executor.write_batch_optimized(dlq_path, lines)
+        except Exception:
+            # Em último caso, ignora erro de DLQ para não bloquear o worker
+            pass
 
 class LokiSink(AbstractSink):
     def __init__(self, queue_size: int, batch_size: int, batch_timeout: float, url: str, buffer_dir, max_buffer_size_mb: int = 0):
@@ -454,6 +642,7 @@ class LokiSink(AbstractSink):
         self.batch_size = batch_size
         self.batch_timeout = batch_timeout
         self.url = url
+        
         # NOVO: rate limiter adaptativo
         self.rate_limiter = AdaptiveRateLimiter()
         self.rate_limiter.set_logger(self.logger)
@@ -475,356 +664,362 @@ class LokiSink(AbstractSink):
             target_latency=self.batch_timeout,
             hard_max=hard_max,
         )
-
+        self._recovery_task = None
     async def start(self):
         await super().start()
         self.logger.debug("LokiSink start concluído")
 
-    async def _worker_loop(self):
-        import asyncio
-        self.logger.debug("LokiSink worker loop iniciado")
-        while True:
+    async def _recovery_loop(self):
+        """Tarefa separada que processa batches persistidos sem bloquear o worker principal."""
+        self.logger.info("Recovery loop do LokiSink iniciado", persistence_path=self.persistence_path)
+        backoff_base = float(SINK_PERSISTENCE_RECOVERY_BACKOFF_BASE or 1.0)
+        backoff_max = float(SINK_PERSISTENCE_RECOVERY_BACKOFF_MAX or 30.0)
+        max_retries = int(SINK_PERSISTENCE_RECOVERY_MAX_RETRIES or 10)
+        while not self._shutdown_event.is_set():
             try:
-                await self._send_heartbeat()
-                batch = []
-                # NOVO: fairness - se a fila em memória estiver alta, priorizar drenagem da fila
-                qsize = self.queue.qsize()
-                qcap = max(1, self.queue.maxsize or 1)
-                qload = qsize / qcap
-                disk_data = None
-                if qload < 0.5:
-                    disk_data = await self._read_from_disk_buffer()
-                else:
-                    self.logger.info("Pulando leitura do buffer em disco por alta carga na fila", queue_size=qsize, queue_capacity=qcap, queue_load=round(qload, 3))
-                self.logger.debug("Batch lido do disco", from_disk=bool(disk_data), batch_size=len(disk_data["batch"]) if disk_data else 0)
+                batch = await self._load_persisted_batch()
+                if not batch:
+                    await asyncio.sleep(1.0)
+                     # Adiciona heartbeat mesmo em ciclos sem batch         
+                    await self._send_heartbeat()
+                    continue
 
-                if disk_data:
-                    batch = disk_data["batch"]
-                    file_path = disk_data["file_path"]
-                    restore_path = disk_data.get("restore_path")
-                    from_disk = True
-                else:
+                self.logger.info("Iniciando tentativa de recovery do batch persistido", batch_size=len(batch))
+                attempt = 0
+                current_backoff = backoff_base
+                success = False
+                while attempt < max_retries and not self._shutdown_event.is_set():
+                    attempt += 1
                     try:
-                        target_size = self._batcher.get_optimal_size()
-                        # NOVO: deadline de montagem do batch para reduzir latência
-                        assemble_deadline = time.monotonic() + min(1.0, max(0.1, self.batch_timeout / 3.0))
-                        deadline_hit = False
-                        while len(batch) < target_size:
-                            remaining = assemble_deadline - time.monotonic()
-                            if remaining <= 0:
-                                deadline_hit = True
-                                break
-                            try:
-                                item = await asyncio.wait_for(self.queue.get(), timeout=min(0.2, remaining))
-                                batch.append(item)
-                            except (asyncio.TimeoutError, asyncio.QueueEmpty):
-                                # Se não chegou item a tempo e já temos algum batch, enviar assim mesmo
-                                if batch:
-                                    deadline_hit = True
-                                    break
-                                # Sem itens: continuar pequeno sleep para não busy-loopar
-                                await asyncio.sleep(0.05)
-                        if batch:
-                            self.logger.debug("Batch montado a partir da fila",
-                                              target_size=target_size,
-                                              actual_size=len(batch),
-                                              deadline_hit=deadline_hit)
-                    except (asyncio.TimeoutError, asyncio.QueueEmpty):
-                        if not batch:
-                            await asyncio.sleep(1); continue
-                    from_disk = False
-
-                if batch:
-                    self.logger.debug("Enviando batch para Loki", batch_size=len(batch))
-                    try:
-                        success = await self.circuit_breaker.call(self._send_batch_protected, batch)
-                        state_val = 0 if self.circuit_breaker.state == CircuitBreakerState.CLOSED else (1 if self.circuit_breaker.state == CircuitBreakerState.OPEN else 2)
-                        metrics.CIRCUIT_BREAKER_STATE.labels(breaker_name=self.circuit_breaker.name).set(state_val)
-                        if from_disk and success:
-                            try:
-                                os.unlink(file_path)
-                            except Exception:
-                                pass
-                        elif not success and not from_disk:
-                            await self._optimized_overflow_to_disk(batch)
-                    except Exception:
-                        self.logger.debug("Erro ao enviar batch para Loki", exc_info=True)
-                        self._track_error()
-                        if from_disk:
-                            try:
-                                if restore_path:
-                                    os.rename(file_path, restore_path)
-                                else:
-                                    # fallback: tentativa antiga para .jsonl
-                                    os.rename(file_path, file_path.replace('.processing', '.jsonl'))
-                            except Exception:
-                                pass
+                        # Adiciona heartbeat em ciclos com batch
+                        await self._send_heartbeat()
+                        ok = await self.send_batch(batch)
+                        if ok:
+                            self.logger.info("Recovery do batch persistido bem-sucedido", attempts=attempt, batch_size=len(batch))
+                            success = True
+                            await self._remove_persistence()
+                            break
                         else:
-                            await self._optimized_overflow_to_disk(batch)
-                await asyncio.sleep(0.01)
-            except asyncio.CancelledError:
-                self.logger.debug("LokiSink worker cancelado")
-                break
-            except Exception:
-                self.logger.debug("Erro no worker do LokiSink", exc_info=True)
-                self._track_error()
-                await asyncio.sleep(5)
+                            await self._send_heartbeat()
+                            self.logger.warning("Recovery do batch persistido falhou (retry)", attempt=attempt, batch_size=len(batch))
+                    except Exception as e:
+                        self.logger.error("Exceção ao tentar recovery do batch persistido", attempt=attempt, error=str(e))
+                    await asyncio.sleep(min(current_backoff, backoff_max))
+                    current_backoff = min(current_backoff * 2.0, backoff_max)
 
-    async def _send_batch_protected(self, batch: List[Dict]) -> bool:
-        self.logger.debug("Protegendo envio de batch para Loki", batch_size=len(batch))
-        return await self.send_batch(batch)
+                if not success:
+                    # Após retries, mover para DLQ se configurado, senão remover persistência
+                    if TIMESTAMP_CLAMP_DLQ:
+                        try:
+                            await self._send_heartbeat()
+                            await self._send_to_dlq(batch, f"persistence_exhausted_{attempt}")
+                        except Exception as e:
+                            self.logger.error("Falha ao mover batch persistido para DLQ", error=str(e))
+                    # Sempre remover persistência após todos os retries, independente do DLQ
+                    try:
+                        await self._send_heartbeat()
+                        await self._remove_persistence()
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                await self._send_heartbeat()
+                self.logger.error("Erro no recovery loop do LokiSink", error=str(e))
+                await asyncio.sleep(1.0)
+        self.logger.info("Recovery loop do LokiSink finalizado")
 
     async def send_batch(self, batch: List[Dict]) -> bool:
-        self.logger.debug("Preparando envio de batch para Loki", batch_size=len(batch))
-        correlation_id = CorrelationContext.get_correlation_id() or CorrelationContext.generate_correlation_id()
-        CorrelationContext.set_correlation_id(correlation_id)
-        session = await http_session_pool.get_session()
+        """Envia batch para o Loki"""
+        self.logger.debug("Enviando batch para Loki", batch_size=len(batch))
+        
+        if self._is_self_batch(batch):
+            self.logger.debug("Ignorando batch do próprio agente")
+            return True
+            
         try:
-            streams = []
-            for item in batch:
-                # NOVO: evitar cópia de labels quando seguro (não modificamos labels no envio)
-                labels = item['labels'] or {"source": item.get('meta',{}).get('source_type','unknown')}
-                streams.append({"stream": labels, "values": [[str(item['ts']), item['line']]]})
-            payload = {"streams": streams}
-
-            # NOVO: dump único do payload (json + encode) e estimativa
+            # Preparação do payload
+            streams = {}
+            for record in batch:
+                ts = record.get('ts', int(time.time() * 1e9))
+                line = record.get('line', '')
+                labels = record.get('labels', {})
+                
+                # Converte labels para o formato do Loki "{key="value",key2="value2"}"
+                labels_str = '{' + ','.join([f'{k}="{v}"' for k, v in labels.items()]) + '}'
+                
+                # Agrupa por labels
+                if labels_str not in streams:
+                    streams[labels_str] = []
+                    
+                # Adiciona entrada no stream
+                streams[labels_str].append([str(ts), line])
+            
+            # Formato do payload Loki
+            payload = {"streams": [{"stream": {"app": "log_capturer", **eval(f"dict({k[1:-1]})")}, 
+                                  "values": v} for k, v in streams.items()]}
+            
+            # Envia para o Loki
+            session = await http_session_pool.get_session()
             try:
-                raw = json.dumps(payload).encode("utf-8")
-                payload_bytes_est = len(raw)
-                self.logger.debug("Payload preparado (dump único)", bytes=payload_bytes_est, batch_size=len(streams))
-            except Exception:
-                raw = None
-                payload_bytes_est = max(1, len(streams) * 256)
-
-            # Throttling por rate limit adaptativo proporcional ao tamanho do payload
-            # NOVO: reduzir custo sob alta carga de fila para drenar backlog
-            try:
-                qcap = max(1, self.queue.maxsize or 1)
-                qload = (self.queue.qsize() / qcap)
-            except Exception:
-                qload = 0.0
-            eff_bytes_per_token = float(SINK_RATE_LIMIT_BYTES_PER_TOKEN)
-            if qload >= 0.90:
-                eff_bytes_per_token *= 8.0
-            elif qload >= 0.75:
-                eff_bytes_per_token *= 4.0
-            elif qload >= 0.50:
-                eff_bytes_per_token *= 2.0
-            cost_tokens = max(1.0, payload_bytes_est / eff_bytes_per_token)
-            waited = await self.rate_limiter.acquire(cost_tokens)
-            if waited > 0:
-                try:
-                    metrics.THROTTLING_DELAY.labels(sink_name=self.name).observe(waited)
-                except Exception:
-                    pass
-                self.logger.debug("Atraso aplicado por rate limiting", waited_ms=round(waited*1000,2), cost_tokens=round(cost_tokens,2))
-
-            # NOVO: compressão opcional com nível adaptativo e fallback para gzip
-            use_compression = SINK_HTTP_COMPRESSION_ENABLED and payload_bytes_est >= SINK_HTTP_COMPRESSION_MIN_BYTES
-            headers = {}
-            data_arg = None
-            json_arg = None
-            algo_used = None
-            if use_compression and raw is not None:
-                algo = (SINK_HTTP_COMPRESSION_ALGO or "gzip").lower()
-                # nível base configurado
-                level = int(SINK_HTTP_COMPRESSION_LEVEL)
-                # NOVO: ajuste adaptativo por tamanho e CPU
-                if SINK_HTTP_COMPRESSION_ADAPTIVE:
-                    try:
-                        import psutil
-                        cpu = psutil.cpu_percent(interval=None)
-                    except Exception:
-                        cpu = 0.0
-                    if payload_bytes_est < 128 * 1024:
-                        level = 1 if cpu > 60 else 2
-                    elif payload_bytes_est < 512 * 1024:
-                        level = 2 if cpu > 70 else 3
-                    elif payload_bytes_est < 2 * 1024 * 1024:
-                        level = 3 if cpu > 80 else 4
-                    else:
-                        level = 3 if cpu > 85 else 4
-                    self.logger.info("Compressão adaptativa definida", base=SINK_HTTP_COMPRESSION_LEVEL, effective=level, bytes=payload_bytes_est, cpu_percent=cpu)
-                try:
-                    if algo in ("zstd","zst"):
-                        import zstandard as zstd
-                        cctx = zstd.ZstdCompressor(level=level)
-                        comp = cctx.compress(raw)
-                        headers["Content-Encoding"] = "zstd"
-                        headers["Content-Type"] = "application/json"
-                        data_arg = comp
-                        algo_used = "zstd"
-                    else:
-                        comp = gzip.compress(raw, compresslevel=level)
-                        headers["Content-Encoding"] = "gzip"
-                        headers["Content-Type"] = "application/json"
-                        data_arg = comp
-                        algo_used = "gzip"
-                    self.logger.info("Compressão aplicada ao batch", algo=algo_used, original_bytes=payload_bytes_est, compressed_bytes=len(data_arg), ratio=round(len(data_arg)/payload_bytes_est, 3))
-                except Exception as e:
-                    self.logger.error("Falha ao comprimir payload; enviando sem compressão", error=str(e))
-                    json_arg = payload
-            else:
-                if not SINK_HTTP_COMPRESSION_ENABLED:
-                    self.logger.debug("Compressão desabilitada por configuração")
-                elif payload_bytes_est < SINK_HTTP_COMPRESSION_MIN_BYTES:
-                    self.logger.debug("Payload abaixo do limiar de compressão", bytes=payload_bytes_est, min_bytes=SINK_HTTP_COMPRESSION_MIN_BYTES)
-                json_arg = payload
-
-            start = time.monotonic()
-            batch_size = len(streams)
-
-            async def _req(session, payload_or_bytes, correlation_id, headers, json_mode: bool):
-                if json_mode:
-                    async with session.post(self.url, json=payload_or_bytes) as resp:
-                        if resp.status in (200, 204):
-                            return True, resp.status, ""
+                start_time = time.time()
+                
+                # NOVO: Implementar suporte a compressão HTTP
+                headers = {}
+                
+                # Determinar se devemos usar compressão
+                use_compression = SINK_HTTP_COMPRESSION_ENABLED
+                
+                # Verificar tamanho do payload para compressão
+                payload_json = json.dumps(payload)
+                payload_bytes = payload_json.encode('utf-8')
+                payload_size = len(payload_bytes)
+                
+                # Aplicar compressão se habilitada e payload grande o suficiente
+                if use_compression and payload_size >= SINK_HTTP_COMPRESSION_MIN_BYTES:
+                    compressed_payload = None
+                    compression_algo = SINK_HTTP_COMPRESSION_ALGO
+                    compression_level = SINK_HTTP_COMPRESSION_LEVEL
+                    
+                    # Compressão adaptativa - ajustar nível conforme tamanho
+                    if SINK_HTTP_COMPRESSION_ADAPTIVE:
+                        # Payload pequeno = compressão mais leve, payload grande = mais pesada
+                        if payload_size < 50 * 1024:  # < 50KB
+                            compression_level = max(1, compression_level - 2)
+                        elif payload_size > 500 * 1024:  # > 500KB
+                            compression_level = min(9, compression_level + 1)
+                    
+                    # Aplicar algoritmo de compressão selecionado
+                    if compression_algo == 'gzip':
+                        import gzip
+                        compressed_payload = gzip.compress(payload_bytes, compresslevel=compression_level)
+                        headers['Content-Encoding'] = 'gzip'
+                    
+                    elif compression_algo == 'zstd':
                         try:
-                            body = await resp.text()
-                        except Exception:
-                            body = ""
-                        return False, resp.status, body
+                            import zstd
+                            compressed_payload = zstd.compress(payload_bytes, compression_level)
+                            headers['Content-Encoding'] = 'zstd'
+                        except ImportError:
+                            # Fallback para gzip se zstd não disponível
+                            import gzip
+                            compressed_payload = gzip.compress(payload_bytes, compresslevel=compression_level)
+                            headers['Content-Encoding'] = 'gzip'
+                    
+                    elif compression_algo == 'br':
+                        try:
+                            import brotli
+                            compressed_payload = brotli.compress(payload_bytes, quality=compression_level)
+                            headers['Content-Encoding'] = 'br'
+                        except ImportError:
+                            # Fallback para gzip se brotli não disponível
+                            import gzip
+                            compressed_payload = gzip.compress(payload_bytes, compresslevel=compression_level)
+                            headers['Content-Encoding'] = 'gzip'
+                    
+                    # Se conseguimos comprimir, usar o payload comprimido
+                    if compressed_payload:
+                        payload_data = compressed_payload
+                        headers['Content-Type'] = 'application/json'
+                        
+                        # Log da compressão aplicada
+                        compression_ratio = round((1 - len(compressed_payload) / payload_size) * 100, 1)
+                        self.logger.debug(
+                            "Compressão HTTP aplicada", 
+                            algorithm=compression_algo,
+                            level=compression_level,
+                            original_size=payload_size,
+                            compressed_size=len(compressed_payload),
+                            ratio_percent=f"{compression_ratio}%"
+                        )
+                    else:
+                        # Fallback para não comprimido
+                        payload_data = payload
+                        
                 else:
-                    async with session.post(self.url, data=payload_or_bytes, headers=headers) as resp:
-                        if resp.status in (200, 204):
-                            return True, resp.status, ""
-                        try:
-                            body = await resp.text()
-                        except Exception:
-                            body = ""
-                        return False, resp.status, body
+                    # Sem compressão - usar payload normal
+                    payload_data = payload
+                
+                # Fazer a requisição com ou sem compressão conforme determinado acima
+                async with session.post(self.url, json=payload if not headers else None,
+                                        data=payload_data if headers else None,
+                                        headers=headers) as resp:
+                    response_text = await resp.text()
+                    success = 200 <= resp.status < 300
+                    if success:
+                        # feedback para rate limiter / métricas se necessário
+                        return True
 
-            try:
-                ok, http_status, http_body = await self.retry_client.execute(
-                    _req, session, data_arg if data_arg is not None else json_arg, correlation_id, headers, data_arg is None
-                )
-                # Fallback automático: se encoding não suportado, tenta gzip uma vez
-                if (not ok) and use_compression and algo_used not in (None, "gzip") and http_status in (400, 415) and isinstance(http_body, str) and ("encoding" in http_body.lower() or "unsupported" in http_body.lower()):
-                    try:
-                        gz = gzip.compress(raw or json.dumps(payload).encode("utf-8"), compresslevel=int(SINK_HTTP_COMPRESSION_LEVEL))
-                        headers2 = {"Content-Encoding": "gzip", "Content-Type": "application/json"}
-                        self.logger.warning("Fallback de Content-Encoding para gzip após erro do endpoint", http_status=http_status)
-                        ok, http_status, http_body = await self.retry_client.execute(_req, session, gz, correlation_id, headers2, False)
-                        algo_used = "gzip"
-                    except Exception:
-                        pass
+                    # Erro não-success: checar caso de timestamp 'too far behind'
+                    self.logger.error("Erro do Loki", status=resp.status, response=response_text[:500])
+                    if resp.status == 400 and "entry too far behind" in (response_text or ""):
+                        # Caso: timestamps antigos rejeitados pelo Loki
+                        if TIMESTAMP_CLAMP_ENABLED:
+                            # Tentar clamped resend: ajustar timestamps para agora e reenviar uma vez
+                            try:
+                                self.logger.info("Tentando reenviar batch com timestamps ajustados (clamp)", batch_size=len(batch))
+                                now_ns = int(time.time() * 1e9)
+                                adjusted = []
+                                for rec in batch:
+                                    new_rec = dict(rec)
+                                    new_rec['ts'] = now_ns
+                                    adjusted.append(new_rec)
+                                # Rebuild payload e reenvia (sem headers alterados)
+                                adj_streams = {}
+                                for record in adjusted:
+                                    ts = record.get('ts', int(time.time() * 1e9))
+                                    line = record.get('line', '')
+                                    labels = record.get('labels', {})
+                                    labels_str = '{' + ','.join([f'{k}="{v}"' for k, v in labels.items()]) + '}'
+                                    adj_streams.setdefault(labels_str, []).append([str(ts), line])
+                                adj_payload = {"streams": [{"stream": {"app": "log_capturer", **eval(f"dict({k[1:-1]})")}, "values": v} for k, v in adj_streams.items()]}
+                                adj_payload_json = json.dumps(adj_payload)
+                                adj_payload_bytes = adj_payload_json.encode('utf-8')
+                                # aplicar mesma compressão se necessário
+                                adj_payload_data = adj_payload_bytes
+                                if headers.get('Content-Encoding'):
+                                    # recomprimir conforme algoritmo (fallback gzip se necessário)
+                                    try:
+                                        if headers['Content-Encoding'] == 'gzip':
+                                            import gzip
+                                            adj_payload_data = gzip.compress(adj_payload_bytes, compresslevel=SINK_HTTP_COMPRESSION_LEVEL)
+                                        elif headers['Content-Encoding'] in ('zstd','zst'):
+                                            import zstd as _z
+                                            adj_payload_data = _z.compress(adj_payload_bytes, SINK_HTTP_COMPRESSION_LEVEL)
+                                    except Exception:
+                                        adj_payload_data = adj_payload_bytes
+
+                                async with session.post(self.url, json=adj_payload if not headers else None,
+                                                        data=adj_payload_data if headers else None,
+                                                        headers=headers) as resp2:
+                                    text2 = await resp2.text()
+                                    if 200 <= resp2.status < 300:
+                                        self.logger.info("Reenvio com clamp bem-sucedido", batch_size=len(batch))
+                                        return True
+                                    else:
+                                        self.logger.error("Reenvio com clamp falhou", status=resp2.status, response=text2[:500])
+                                        # Ainda falhando: mover para DLQ se configurado
+                                        if TIMESTAMP_CLAMP_DLQ:
+                                            await self._send_to_dlq(batch, "timestamp_rejected_after_clamp")
+                                            return True
+                                        return False
+                            except Exception as e:
+                                self.logger.error("Erro ao tentar reenvio com clamp", error=str(e))
+                                if TIMESTAMP_CLAMP_DLQ:
+                                    await self._send_to_dlq(batch, "timestamp_rejected_after_clamp_error")
+                                    return True
+                                return False
+                        else:
+                            # Clamp desabilitado: mover para DLQ se policy exigir, caso contrário falha
+                            self.logger.warning("Timestamp rejeitado pelo Loki e clamp desabilitado", batch_size=len(batch))
+                            if TIMESTAMP_CLAMP_DLQ:
+                                await self._send_to_dlq(batch, "timestamp_rejected")
+                                return True
+                            return False
+
+                    # Outros erros HTTP: considerar retry no worker/persistência
+                    return False
             except Exception as e:
-                # Falha após tentativas: conta como dropped e loga erro
-                self._track_error()
-                metrics.PROCESSING_DROPPED.inc(batch_size)
-                if not self._is_self_batch(batch):
-                    self.logger.error("Falha ao enviar batch para Loki (após retry)", error=str(e), batch_size=batch_size)
-                else:
-                    self.logger.debug("Falha ao enviar batch para Loki (após retry) - suprimido para evitar feedback", error=str(e), batch_size=batch_size)
-                # feedback ao rate limiter
-                try:
-                    self.rate_limiter.on_feedback(False, 599, SINK_RATE_LIMIT_LATENCY_TARGET_MS * 2)
-                except Exception:
-                    pass
+                self.logger.error("Exceção ao enviar para Loki", error=str(e))
                 return False
             finally:
-                # NOVO: liberar buffers grandes para reduzir pressão de GC
-                try:
-                    del payload
-                except Exception:
-                    pass
+                await http_session_pool.return_session(session)
+        except Exception as e:
+            # Captura o stack trace completo
+            self.logger.error("Erro ao preparar payload para Loki", 
+                             error=str(e),
+                             traceback=traceback.format_exc())
+            return False
 
-            elapsed = time.monotonic() - start
-            duration_ms = elapsed * 1000.0
+    async def _worker_loop(self):
+        """Loop principal do worker para processamento em lote com persistência opcional."""
+        self.logger.info("Worker loop do LokiSink iniciado", persistence_enabled=self._persistence_enabled)
+        consecutive_failures = 0
+        max_consecutive_failures = int(SINK_PERSISTENCE_RECOVERY_MAX_RETRIES or 10)
+        persisted_retry_backoff = float(SINK_PERSISTENCE_RECOVERY_BACKOFF_BASE or 1.0)
+        persisted_retry_backoff_max = float(SINK_PERSISTENCE_RECOVERY_BACKOFF_MAX or 30.0)
+        while not self._shutdown_event.is_set():
             try:
-                metrics.SINK_SEND_LATENCY.labels(sink_name=self.name).observe(elapsed)
-            except Exception:
-                pass
+                batch = []
+                from_disk = False
 
-            # Feedback ao rate limiter
-            try:
-                self.rate_limiter.on_feedback(ok, http_status, duration_ms)
-            except Exception:
-                pass
+                # Removido: não carregar batch persistido aqui, apenas processar da fila
+                # O recovery de batches persistidos é feito exclusivamente pela tarefa _recovery_loop
 
-            # NOVO: tratamento de 400 "entry too far behind"
-            if (not ok) and http_status == 400 and isinstance(http_body, str) and ("entry too far behind" in http_body.lower() or "too far behind" in http_body.lower()):
-                # Log do motivo (como já ocorre)
-                body_preview = (http_body or "")[:500]
-                self.logger.warning("Lote rejeitado pelo Loki (timestamps muito antigos)",
-                                    batch_size=len(batch),
-                                    duration_ms=round(duration_ms, 2),
-                                    url=self.url,
-                                    http_status=http_status,
-                                    http_body_preview=body_preview)
-                if TIMESTAMP_CLAMP_DLQ:
-                    await self._send_to_dlq(batch, "entry too far behind")
-                else:
-                    # Apenas dropa (não reprocessa)
+                # coleta de logs da fila (não bloqueante)
+                consecutive_failures = 0
+                start_wait = time.time()
+                batch_size = self._batcher.get_optimal_size()
+                while (len(batch) < batch_size and 
+                      time.time() - start_wait < self.batch_timeout and
+                      not self._shutdown_event.is_set()):
                     try:
-                        metrics.PROCESSING_DROPPED.inc(len(batch))
-                    except Exception:
-                        pass
-                # Considera como consumido para não voltar à fila/overflow
-                return True
+                        item = await asyncio.wait_for(
+                            self.queue.get(), 
+                            timeout=max(0.1, self.batch_timeout - (time.time() - start_wait))
+                        )
+                        batch.append(item)
+                    except asyncio.TimeoutError:
+                        break
+                if batch and self._persistence_enabled:
+                    await self._persist_batch(batch)
 
-            if ok:
-                # Observa tamanho do batch e registra fila atual (consumo)
-                metrics.PROCESSING_BATCH_SIZE.labels(sink_name=self.name).observe(batch_size)
-                # ajuste do batch adaptativo baseado na latência observada
-                try:
-                    self._batcher.adjust_batch_size(elapsed)
-                except Exception:
-                    pass
-                try:
-                    metrics.SINK_QUEUE_SIZE.labels(sink_name=self.name).set(self.queue.qsize())
-                except Exception:
-                    pass
-                if not self._is_self_batch(batch):
-                    self.logger.info("Loki consumiu logs (batch enviado)", batch_size=batch_size, duration_ms=round(duration_ms, 2), url=self.url)
-                else:
-                    self.logger.debug("Loki consumiu logs (batch enviado) - suprimido para evitar feedback", batch_size=batch_size, duration_ms=round(duration_ms, 2), url=self.url)
-                return True
-            else:
-                # Contabiliza como dropped e loga aviso com status/corpo
-                metrics.PROCESSING_DROPPED.inc(batch_size)
-                body_preview = (http_body or "")[:500]
-                if not self._is_self_batch(batch):
-                    self.logger.warning("Loki não confirmou consumo do batch",
-                                        batch_size=batch_size,
-                                        duration_ms=round(duration_ms, 2),
-                                        url=self.url,
-                                        http_status=http_status,
-                                        http_body_preview=body_preview)
-                else:
-                    self.logger.debug("Loki não confirmou consumo do batch - suprimido para evitar feedback",
-                                      batch_size=batch_size, duration_ms=round(duration_ms, 2),
-                                      url=self.url, http_status=http_status)
-                return False
-        finally:
-            await http_session_pool.return_session(session)
+                if not batch:
+                    try:
+                        item = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                        batch.append(item)
+                        if self._persistence_enabled:
+                            await self._persist_batch(batch)
+                    except asyncio.TimeoutError:
+                        await asyncio.sleep(0.1)
+                        # Adiciona heartbeat mesmo em ciclos sem batch
+                        await self._send_heartbeat()
+                        continue
 
-    async def _send_to_dlq(self, batch: List[Dict], reason: str):
-        """Grava registros rejeitados pelo Loki em DLQ em disco com o motivo."""
-        try:
-            dlq_path = str(BASE_DIR / "dlq" / "loki_rejected.log")
-            lines = []
-            for item in batch:
-                meta = dict(item.get("meta", {}))
-                meta["is_dlq"] = True
-                meta["dlq_reason"] = reason
-                meta["dlq_sink"] = "loki"
-                entry = {
-                    "ts": item.get("ts"),
-                    "labels": item.get("labels"),
-                    "line": item.get("line"),
-                    "meta": meta
-                }
-                lines.append(json.dumps(entry) + "\n")
-                try:
-                    src = item.get("meta", {}).get("source_type", "unknown")
-                    metrics.LOGS_DLQ.labels(source_type=src, reason="too_far_behind").inc()
-                except Exception:
-                    pass
-            await optimized_file_executor.write_batch_optimized(dlq_path, lines)
-        except Exception:
-            # Em último caso, ignora erro de DLQ para não bloquear o worker
-            pass
+                if batch:
+                    try:
+                        batch_size = len(batch)
+                        success = await self.send_batch(batch)
+                        self._stats['batches_processed'] += 1
+                        if success:
+                            await self._remove_persistence()
+                            self._stats['logs_sent'] += len(batch)
+                            consecutive_failures = 0
+                            persisted_retry_backoff = float(SINK_PERSISTENCE_RECOVERY_BACKOFF_BASE or 1.0)
+                        else:
+                            if not from_disk:
+                                await self._optimized_overflow_to_disk(batch)
+                            self._stats['batches_failed'] += 1
+                            if from_disk:
+                                consecutive_failures += 1
+                                try:
+                                    await asyncio.sleep(min(persisted_retry_backoff, persisted_retry_backoff_max))
+                                except Exception:
+                                    pass
+                                persisted_retry_backoff = min(persisted_retry_backoff * 2.0, persisted_retry_backoff_max)
+                    except Exception as e:
+                        self.logger.error("Erro ao processar batch", 
+                                        error=str(e), 
+                                        traceback=traceback.format_exc(),
+                                        batch_size=len(batch),
+                                        from_disk=from_disk)
+                        if not from_disk:
+                            await self._optimized_overflow_to_disk(batch)
+                        else:
+                            consecutive_failures += 1
+                        self._stats['batches_failed'] += 1
+                # Adiciona heartbeat ao final de cada ciclo do loop
+                await self._send_heartbeat()
+            except asyncio.CancelledError:
+                self.logger.info("Worker loop do LokiSink cancelado")
+                break
+            except Exception as e:
+                self.logger.error("Erro crítico no worker loop do LokiSink", 
+                                error=str(e),
+                                traceback=traceback.format_exc())
+                await asyncio.sleep(1)
+        self.logger.info("Worker loop do LokiSink finalizado", stats=self._stats)
 
 class ElasticsearchSink(AbstractSink):
     def __init__(self, queue_size: int, hosts: List[str], index_prefix: str, buffer_dir):
@@ -879,94 +1074,78 @@ class ElasticsearchSink(AbstractSink):
             return False
 
     async def _worker_loop(self):
-        import asyncio
-        while True:
+        """Loop principal do worker para processamento em lote com persistência opcional."""
+        self.logger.info("Worker loop do ElasticsearchSink iniciado", persistence_enabled=self._persistence_enabled)
+        
+        while not self._shutdown_event.is_set():
             try:
-                await self._send_heartbeat()
                 batch = []
-                try:
-                    while len(batch) < self.batch_size:
-                        item = await asyncio.wait_for(self.queue.get(), timeout=0.5)
-                        batch.append(item)
-                except (asyncio.TimeoutError, asyncio.QueueEmpty):
-                    if not batch:
-                        await asyncio.sleep(0.1); continue
-                if batch:
-                    success = await self.send_batch(batch)
-                    if not success:
-                        await self._optimized_overflow_to_disk(batch)
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                self._track_error()
-                await asyncio.sleep(5)
-
-class SplunkSink(AbstractSink):
-    def __init__(self, queue_size: int, url: str, token_secret: str, buffer_dir, secret_manager):
-        super().__init__("splunk", queue_size, buffer_dir)
-        self.url = url
-        self.token = secret_manager.get_secret(token_secret) or ""
-        self.batch_size = 100
-
-    async def start(self):
-        await super().start()
-        self.logger.debug("SplunkSink start concluído")
-
-    async def stop(self):
-        await super().stop()
-
-    async def send_batch(self, batch: List[Dict]) -> bool:
-        self.logger.debug("Enviando batch para Splunk", batch_size=len(batch))
-        session = await http_session_pool.get_session()
-        try:
-            payload = []
-            for log in batch:
-                payload.append({
-                    "time": log['ts'] / 1e9,
-                    "event": log['line'],
-                    "source": log.get('meta', {}).get('source_id', 'unknown'),
-                    "sourcetype": log.get('meta', {}).get('source_type', 'log'),
-                    "fields": log['labels']
-                })
-            headers = {"Authorization": f"Splunk {self.token}"}
-            async with session.post(self.url, json=payload, headers=headers) as resp:
-                if resp.status == 200:
+                from_disk = False
+                
+                # Verifica se há batch persistido para recuperação
+                if self._persistence_enabled:
+                    persisted_batch = await self._load_persisted_batch()
+                    if persisted_batch:
+                        batch = persisted_batch
+                        from_disk = True
+                
+                # Se não há batch persistido, coleta da fila
+                if not batch:
+                    start_wait = time.time()
                     try:
-                        result = await resp.json()
-                    except Exception:
-                        return False
-                    return result.get('code') == 0
-                return False
-        except Exception:
-            self._track_error()
-            return False
-        finally:
-            await http_session_pool.return_session(session)
-
-    async def _worker_loop(self):
-        import asyncio
-        while True:
-            try:
-                await self._send_heartbeat()
-                batch = []
-                try:
-                    while len(batch) < self.batch_size:
-                        item = await asyncio.wait_for(self.queue.get(), timeout=0.5)
+                        item = await asyncio.wait_for(self.queue.get(), timeout=5.0)
                         batch.append(item)
-                except (asyncio.TimeoutError, asyncio.QueueEmpty):
-                    if not batch:
-                        await asyncio.sleep(0.1); continue
+                        
+                        # Coleta mais itens disponíveis até o limite do batch
+                        while len(batch) < self.batch_size and not self.queue.empty():
+                            try:
+                                batch.append(self.queue.get_nowait())
+                            except asyncio.QueueEmpty:
+                                break
+                        
+                        # Persiste o novo batch se a persistência estiver ativada
+                        if batch and self._persistence_enabled:
+                            await self._persist_batch(batch)
+                            
+                    except asyncio.TimeoutError:
+                        # Timeout, continua loop
+                        continue
+                
+                # Processa o batch
                 if batch:
-                    success = await self.send_batch(batch)
-                    if not success:
-                        await self._optimized_overflow_to_disk(batch)
+                    try:
+                        success = await self.send_batch(batch)
+                        self._stats['batches_processed'] += 1
+                        
+                        if success:
+                            # Sucesso: remove persistência e atualiza contadores
+                            await self._remove_persistence()
+                            self._stats['logs_sent'] += len(batch)
+                        else:
+                            # Falha: tenta buffer em disco
+                            if not from_disk:
+                                await self._optimized_overflow_to_disk(batch)
+                            self._stats['batches_failed'] += 1
+                            
+                    except Exception as e:
+                        self.logger.error("Erro ao processar batch", 
+                                         error=str(e), 
+                                         batch_size=len(batch))
+                        
+                        if not from_disk:
+                            await self._optimized_overflow_to_disk(batch)
+                        self._stats['batches_failed'] += 1
+                        
             except asyncio.CancelledError:
+                self.logger.info("Worker loop do ElasticsearchSink cancelado")
                 break
-            except Exception:
-                self._track_error()
-                await asyncio.sleep(5)
+            except Exception as e:
+                self.logger.error("Erro no worker loop do ElasticsearchSink", error=str(e))
+                await asyncio.sleep(1)
+        
+        self.logger.info("Worker loop do ElasticsearchSink finalizado", stats=self._stats)
 
-# --- ADICIONADO: LocalFileSink ---
+# --- LocalFileSink ---
 class LocalFileSink(AbstractSink):
     def __init__(self, queue_size: int):
         local_buffer_dir = BASE_DIR / "local_buffer"
@@ -974,6 +1153,61 @@ class LocalFileSink(AbstractSink):
         # Limite do buffer local agora configurável (aciona limpeza unificada e cota)
         super().__init__("localfile", queue_size, local_buffer_dir, max_buffer_size_mb=LOCAL_SINK_MAX_SIZE_MB)
         self.batch_size = LOCAL_SINK_BATCH_SIZE
+        self.max_file_size_bytes = int(LOCAL_SINK_MAX_FILE_SIZE_MB) * 1024 * 1024
+
+    async def _maybe_rotate_file(self, file_path: str, pending_bytes: int = 0):
+        """
+        Se o arquivo alvo exceder o limite (tamanho atual + bytes pendentes), faz rotação
+        e comprime o rotacionado de forma assíncrona (zstd|lz4|gzip conforme config).
+        """
+        try:
+            p = Path(file_path)
+            if self.max_file_size_bytes <= 0 or not p.exists():
+                return
+            current_size = p.stat().st_size
+            if current_size + max(0, pending_bytes) <= self.max_file_size_bytes:
+                return
+            ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+            base = p.name
+            dirp = p.parent
+            idx = 0
+            rotated = dirp / f"{base}.{ts}.{idx}"
+            while rotated.exists():
+                idx += 1
+                rotated = dirp / f"{base}.{ts}.{idx}"
+            os.rename(str(p), str(rotated))
+            self.logger.info("Arquivo local rotacionado", original=file_path, rotated=str(rotated), size_bytes=current_size)
+            ext = ".zst" if DISK_BUFFER_COMPRESSION_ALGO in ("zstd", "zst") else (".lz4" if DISK_BUFFER_COMPRESSION_ALGO == "lz4" else ".gz")
+            dst = rotated.with_suffix(rotated.suffix + ext)
+            def _compress_sync(src: Path, dst: Path):
+                algo = DISK_BUFFER_COMPRESSION_ALGO
+                level = int(DISK_BUFFER_COMPRESSION_LEVEL)
+                try:
+                    with open(src, 'rb') as fin:
+                        if algo == 'zstd' or algo == 'zst':
+                            import zstd
+                            compressed = zstd.compress(fin.read(), level=level)
+                            with open(dst, 'wb') as fout:
+                                fout.write(compressed)
+                        elif algo == 'lz4':
+                            import lz4.frame
+                            with lz4.frame.open(dst, 'wb', compression_level=level) as fout:
+                                fout.write(fin.read())
+                        else:
+                            import gzip
+                            with gzip.open(dst, 'wb', compresslevel=level) as fout:
+                                fout.write(fin.read())
+                    # Remove original se compressão sucedeu
+                    if dst.exists() and dst.stat().st_size > 0:
+                        src.unlink()
+                except Exception as e:
+                    self.logger.error(f"Erro ao comprimir arquivo: {str(e)}")
+            try:
+                asyncio.create_task(asyncio.to_thread(_compress_sync, rotated, dst))
+            except Exception:
+                pass
+        except Exception as e:
+            self.logger.error("Falha na rotação de arquivo", file=file_path, error=str(e))
 
     async def send_batch(self, batch: List[Dict]) -> bool:
         self.logger.debug("Enviando batch para arquivo local", batch_size=len(batch))
@@ -994,6 +1228,10 @@ class LocalFileSink(AbstractSink):
 
             ok_count = 0
             for file_path, lines in files_data.items():
+                try:
+                    await self._maybe_rotate_file(file_path, pending_bytes=sum(len(x.encode("utf-8")) for x in lines))
+                except Exception:
+                    pass
                 if await optimized_file_executor.write_batch_optimized(file_path, lines):
                     ok_count += 1
 
@@ -1003,37 +1241,220 @@ class LocalFileSink(AbstractSink):
             return False
 
     async def _worker_loop(self):
-        import asyncio
-        while True:
+        """Loop principal do worker para processamento em lote com persistência opcional."""
+        self.logger.info("Worker loop do LocalFileSink iniciado", persistence_enabled=self._persistence_enabled)
+        
+        while not self._shutdown_event.is_set():
             try:
-                await self._send_heartbeat()
-
-                batch: List[Dict] = []
-                disk_data = await self._read_from_disk_buffer()
-                if disk_data:
-                    batch = disk_data["batch"]
-                    file_path = disk_data["file_path"]
-                    from_disk = True
-                else:
+                batch = []
+                from_disk = False
+                
+                # Verifica se há batch persistido para recuperação
+                if self._persistence_enabled:
+                    persisted_batch = await self._load_persisted_batch()
+                    if persisted_batch:
+                        batch = persisted_batch
+                        from_disk = True
+                
+                # Se não há batch persistido, coleta da fila
+                if not batch:
                     try:
-                        while len(batch) < self.batch_size:
-                            item = await asyncio.wait_for(self.queue.get(), timeout=0.1)
-                            batch.append(item)
-                    except (asyncio.TimeoutError, asyncio.QueueEmpty):
-                        if not batch:
-                            await asyncio.sleep(0.5)
-                            continue
-                    from_disk = False
-
+                        # Espera por um item e depois coleta mais até o batch_size
+                        item = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                        batch.append(item)
+                        
+                        # Tenta esvaziar a fila até o batch_size
+                        for _ in range(min(self.batch_size - 1, self.queue.qsize())):
+                            try:
+                                batch.append(self.queue.get_nowait())
+                            except asyncio.QueueEmpty:
+                                break
+                        
+                        # Persiste o batch se necessário
+                        if self._persistence_enabled and batch:
+                            await self._persist_batch(batch)
+                    except asyncio.TimeoutError:
+                        await asyncio.sleep(0.1)
+                        # Adiciona heartbeat mesmo em ciclos sem batch
+                        await self._send_heartbeat()
+                        continue
+                
+                # Processa o batch
                 if batch:
-                    success = await self.send_batch(batch)
-                    if from_disk and success:
-                        try:
-                            os.unlink(file_path)
-                        except Exception:
-                            pass
+                    try:
+                        success = await self.send_batch(batch)
+                        self._stats['batches_processed'] += 1
+                        
+                        if success:
+                            # Sucesso: remove persistência e atualiza contadores
+                            await self._remove_persistence()
+                            self._stats['logs_written'] += len(batch)
+                        else:
+                            # Falha: tenta buffer em disco
+                            if not from_disk:
+                                await self._optimized_overflow_to_disk(batch)
+                            self._stats['batches_failed'] += 1
+                    except Exception as e:
+                        self.logger.error("Erro ao processar batch", 
+                                        error=str(e), 
+                                        batch_size=len(batch))
+                        if not from_disk:
+                            await self._optimized_overflow_to_disk(batch)
+                        self._stats['batches_failed'] += 1
+                # Adiciona heartbeat ao final de cada ciclo do loop
+                await self._send_heartbeat()
             except asyncio.CancelledError:
+                self.logger.info("Worker loop do LocalFileSink cancelado")
                 break
-            except Exception:
-                self._track_error()
-                await asyncio.sleep(5)
+            except Exception as e:
+                self.logger.error("Erro no worker loop do LocalFileSink", error=str(e))
+                await asyncio.sleep(1)
+        self.logger.info("Worker loop do LocalFileSink finalizado", stats=self._stats)
+
+# SplunkSink - implementação estava ausente
+class SplunkSink(AbstractSink):
+    def __init__(self, queue_size: int, hec_url: str, token_secret: str, buffer_dir, secret_manager):
+        super().__init__("splunk", queue_size, buffer_dir)
+        self.hec_url = hec_url
+        self.token_secret = token_secret
+        self.secret_manager = secret_manager
+        self.batch_size = 100
+        self._token = None
+
+    async def start(self):
+        self._token = self.secret_manager.get_secret(self.token_secret)
+        if not self._token:
+            raise ValueError(f"Splunk HEC token not found for secret: {self.token_secret}")
+        await super().start()
+        self.logger.debug("SplunkSink start concluído")
+
+    async def send_batch(self, batch: List[Dict]) -> bool:
+        self.logger.debug("Enviando batch para Splunk", batch_size=len(batch))
+        if not self._token:
+            self.logger.error("Token HEC não disponível")
+            return False
+        
+        session = await http_session_pool.get_session()
+        try:
+            events = []
+            for log in batch:
+                event = {
+                    "time": log['ts'] / 1e9,  # Splunk espera timestamp em segundos
+                    "source": log.get('meta', {}).get('source_type', 'unknown'),
+                    "sourcetype": "_json",
+                    "event": {
+                        "message": log['line'],
+                        "labels": log['labels'],
+                        "meta": log.get('meta', {})
+                    }
+                }
+                events.append(event)
+            
+            headers = {
+                "Authorization": f"Splunk {self._token}",
+                "Content-Type": "application/json"
+            }
+            
+            # Enviar cada evento separadamente (HEC padrão)
+            for event in events:
+                async with session.post(self.hec_url, json=event, headers=headers) as resp:
+                    if resp.status not in (200, 201):
+                        self.logger.error("Splunk rejeitou evento", status=resp.status)
+                        return False
+            
+            return True
+        except Exception as e:
+            self._track_error()
+            self.logger.error("Erro ao enviar para Splunk", error=str(e))
+            return False
+        finally:
+            await http_session_pool.return_session(session)
+
+    async def _worker_loop(self):
+        """Loop principal do worker para processamento em lote com persistência opcional."""
+        self.logger.info("Worker loop do SplunkSink iniciado", persistence_enabled=self._persistence_enabled)
+        
+        while not self._shutdown_event.is_set():
+            try:
+                batch = []
+                from_disk = False
+                
+                # NOVO: Se persistência habilitada, tentar carregar batch pendente primeiro
+                if self._persistence_enabled:
+                    persisted_batch = await self._load_persisted_batch()
+                    if persisted_batch:
+                        batch = persisted_batch
+                        from_disk = True
+                
+                # Se não há batch persistido, coletar novos logs da fila
+                if not batch:
+                    # Espera até ter logs suficientes ou timeout
+                    start_wait = time.time()
+                    batch_size = self.batch_size  # SplunkSink não tem _batcher
+                    
+                    while (len(batch) < batch_size and 
+                          time.time() - start_wait < 1.0 and  # Usando timeout fixo como fallback
+                          not self._shutdown_event.is_set()):
+                        try:
+                            item = await asyncio.wait_for(
+                                self.queue.get(), 
+                                timeout=max(0.1, 1.0 - (time.time() - start_wait))
+                            )
+                            batch.append(item)
+                        except asyncio.TimeoutError:
+                            break
+                
+                # Se não há logs para processar, aguarda
+                if not batch:
+                    try:
+                        item = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                        batch.append(item)
+                        if self._persistence_enabled:
+                            await self._persist_batch(batch)
+                    except asyncio.TimeoutError:
+                        await asyncio.sleep(0.1)
+                        continue
+        
+                # Processar o batch
+                if batch:
+                    try:
+                        # Mede tamanho antes para métricas
+                        batch_size = len(batch)
+                        
+                        # Tenta enviar para destino
+                        success = await self.send_batch(batch)
+                        
+                        # Atualiza estatísticas
+                        self._stats['batches_processed'] += 1
+                        if success:
+                            await self._remove_persistence()
+                            self._stats['logs_sent'] += len(batch)
+                        else:
+                            if not from_disk:
+                                await self._optimized_overflow_to_disk(batch)
+                            self._stats['batches_failed'] += 1
+            
+                    except Exception as e:
+                        self.logger.error("Erro ao processar batch", 
+                                        error=str(e), 
+                                        traceback=traceback.format_exc(),
+                                        batch_size=len(batch),
+                                        from_disk=from_disk)
+                
+                        # Overflow para disco se não for do disco
+                        if not from_disk:
+                            await self._optimized_overflow_to_disk(batch)
+                        
+                        # Atualiza estatísticas de falha
+                        self._stats['batches_failed'] += 1
+            
+            except asyncio.CancelledError:
+                self.logger.info("Worker loop do SplunkSink cancelado")
+                break
+            except Exception as e:
+                self.logger.error("Erro crítico no worker loop do SplunkSink", 
+                                error=str(e),
+                                traceback=traceback.format_exc())
+                await asyncio.sleep(1)  # Evitar loop tight em caso de erro
+        
+        self.logger.info("Worker loop do SplunkSink finalizado", stats=self._stats)

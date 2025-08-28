@@ -107,3 +107,237 @@ groups:
     annotations:
       summary: "HTTP session pool exhausted"
       description: "No HTTP sessions available in the pool, requests may be blocked."
+
+- name: loki_storage_alerts
+  rules:
+  - alert: LokiDataSizeHigh
+    expr: loki_data_size_gb > 4
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Loki data size approaching limit"
+      description: "Loki data size is {{ $value }}GB, approaching the 5GB limit"
+
+  - alert: LokiDataSizeCritical
+    expr: loki_data_size_gb > 4.5
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Loki data size critical"
+      description: "Loki data size is {{ $value }}GB, very close to the 5GB limit"
+
+  - alert: LokiCompactionFailing
+    expr: increase(loki_compactor_runs_failed_total[1h]) > 0
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Loki compaction failing"
+      description: "Loki compaction has failed {{ $value }} times in the last hour"
+
+  # NOVO: Alertas baseados nas métricas do script
+  - alert: LokiStorageUsageHigh
+    expr: loki_usage_percent > 80
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Loki storage usage high"
+      description: "Loki storage usage is {{ $value }}% of the configured limit"
+
+  - alert: LokiStorageUsageCritical
+    expr: loki_usage_percent > 90
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Loki storage usage critical"
+      description: "Loki storage usage is {{ $value }}% of the configured limit, cleanup may be triggered"
+
+  - alert: LokiMetricsUnavailable
+    expr: loki_metrics_available == 0
+    for: 15m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Loki storage metrics unavailable"
+      description: "Loki storage monitoring script is not generating metrics"
+
+# Alertas do Node Exporter
+- name: node_exporter_alerts
+  rules:
+  - alert: NodeDown
+    expr: up{job="node"} == 0
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Node Exporter está down"
+      description: "Node Exporter na instância {{ $labels.instance }} está indisponível por mais de 2 minutos."
+
+  - alert: HighCPUUsage
+    expr: 100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Alto uso de CPU"
+      description: "CPU usage está em {{ $value }}% na instância {{ $labels.instance }}"
+
+  - alert: HighMemoryUsage
+    expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Alto uso de memória"
+      description: "Uso de memória está em {{ $value }}% na instância {{ $labels.instance }}"
+
+  - alert: HighDiskUsage
+    expr: (1 - (node_filesystem_avail_bytes{fstype!="tmpfs"} / node_filesystem_size_bytes{fstype!="tmpfs"})) * 100 > 85
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Alto uso de disco"
+      description: "Uso do disco {{ $labels.mountpoint }} está em {{ $value }}% na instância {{ $labels.instance }}"
+
+  - alert: HighLoadAverage
+    expr: node_load15 > 2
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Load average alto"
+      description: "Load average de 15min está em {{ $value }} na instância {{ $labels.instance }}"
+
+# Alertas do MySQL Exporter
+- name: mysql_alerts
+  rules:
+  - alert: MySQLDown
+    expr: mysql_up == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "MySQL está down"
+      description: "MySQL na instância {{ $labels.instance }} está indisponível."
+
+  - alert: MySQLHighConnections
+    expr: (mysql_global_status_threads_connected / mysql_global_variables_max_connections) * 100 > 80
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Alto número de conexões MySQL"
+      description: "Conexões MySQL estão em {{ $value }}% do limite na instância {{ $labels.instance }}"
+
+  - alert: MySQLSlowQueries
+    expr: rate(mysql_global_status_slow_queries[5m]) > 5
+    for: 2m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Muitas queries lentas no MySQL"
+      description: "{{ $value }} queries lentas por segundo na instância {{ $labels.instance }}"
+
+  - alert: MySQLInnoDBBufferEfficiency
+    expr: (mysql_global_status_innodb_buffer_pool_reads / mysql_global_status_innodb_buffer_pool_read_requests) * 100 > 5
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Baixa eficiência do buffer pool InnoDB"
+      description: "Buffer pool hit ratio está baixo ({{ $value }}%) na instância {{ $labels.instance }}"
+
+# Alertas do OpenSIPS Exporter
+- name: opensips_alerts
+  rules:
+  - alert: OpenSIPSDown
+    expr: up{job="opensips"} == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "OpenSIPS Exporter está down"
+      description: "OpenSIPS Exporter na instância {{ $labels.instance }} está indisponível."
+
+  - alert: OpenSIPSHighCallRate
+    expr: rate(opensips_core_rcv_requests_total[5m]) > 100
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Alta taxa de chamadas no OpenSIPS"
+      description: "Taxa de requests está em {{ $value }}/s na instância {{ $labels.instance }}"
+
+  - alert: OpenSIPSHighErrorRate
+    expr: rate(opensips_core_err_requests_total[5m]) > 10
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Alta taxa de erros no OpenSIPS"
+      description: "Taxa de erros está em {{ $value }}/s na instância {{ $labels.instance }}"
+
+# Alertas do cAdvisor
+- name: cadvisor_alerts
+  rules:
+  - alert: ContainerDown
+    expr: rate(container_last_seen[5m]) == 0
+    for: 1m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Container parou de reportar métricas"
+      description: "Container {{ $labels.name }} na instância {{ $labels.instance }} não está reportando métricas"
+
+  - alert: ContainerHighCPU
+    expr: rate(container_cpu_usage_seconds_total[5m]) * 100 > 80
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Alto uso de CPU no container"
+      description: "Container {{ $labels.name }} está usando {{ $value }}% de CPU"
+
+  - alert: ContainerHighMemory
+    expr: (container_memory_usage_bytes / container_spec_memory_limit_bytes) * 100 > 85
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Alto uso de memória no container"
+      description: "Container {{ $labels.name }} está usando {{ $value }}% da memória disponível"
+
+  - alert: ContainerRestartLoop
+    expr: rate(container_start_time_seconds[15m]) > 0
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Container em loop de restart"
+      description: "Container {{ $labels.name }} está reiniciando frequentemente"
+
+# Alertas do Docker State Exporter
+- name: docker_state_alerts
+  rules:
+  - alert: DockerStateExporterDown
+    expr: up{job="docker_state"} == 0
+    for: 2m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Docker State Exporter está down"
+      description: "Docker State Exporter na instância {{ $labels.instance }} está indisponível."
+
+  - alert: TooManyUnhealthyContainers
+    expr: count(docker_container_health_status{status!="healthy"}) > 3
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Muitos containers não saudáveis"
+      description: "{{ $value }} containers estão em estado não saudável"

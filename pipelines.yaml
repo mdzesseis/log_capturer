@@ -11,6 +11,10 @@ pipelines:
   - name: timestamp
     pattern: '(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6})'
     type: field
+  - name: error_detector
+    pattern: 'level=ERROR'
+    type: label
+    exclusive: true
   - name: source_tag
     pattern: '\[(?P<source_tag>DOCKER|FILE)\]'
     type: label

@@ -1,0 +1,39 @@
+FROM alpine:3.18
+
+# Instalar dependências necessárias
+RUN apk add --no-cache \
+    bash \
+    curl \
+    bc \
+    coreutils \
+    findutils \
+    python3 \
+    py3-pip \
+    && pip3 install --no-cache-dir requests prometheus-client
+
+# Criar usuário não-root
+RUN addgroup -g 1000 monitor && \
+    adduser -u 1000 -G monitor -s /bin/bash -D monitor
+
+# Criar diretórios com permissões corretas
+RUN mkdir -p /app /scripts /tmp/monitoring && \
+    chown -R monitor:monitor /app /tmp/monitoring && \
+    chmod -R 755 /tmp/monitoring
+
+# Copiar scripts
+COPY scripts/loki-monitor.py /app/
+COPY scripts/loki-monitor.sh /app/
+
+# Tornar scripts executáveis e ajustar permissões
+RUN chmod +x /app/loki-monitor.py /app/loki-monitor.sh && \
+    chown -R monitor:monitor /app
+
+# Garantir que o diretório de métricas seja gravável
+RUN chown -R monitor:monitor /tmp && \
+    chmod -R 755 /tmp
+
+USER monitor
+WORKDIR /app
+
+# Comando padrão - executar monitoramento contínuo
+CMD ["python3", "/app/loki-monitor.py"]

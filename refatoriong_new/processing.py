@@ -249,26 +249,3 @@ class LogProcessor:
             pass
         # Sem transformação
         return {"labels": {}, "fields": {"message": line}}
-        # Tenta JSON
-        try:
-            obj = json.loads(line)
-            if isinstance(obj, dict):
-                self.logger.debug("Fallback JSON aplicado")
-                return {"labels": {}, "fields": obj}
-        except Exception:
-            pass
-        # Tenta KV
-        fields: Dict[str, str] = {}
-        try:
-            for token in filter(None, (t.strip() for t in line.split())):
-                if "=" in token:
-                    k, v = token.split("=", 1)
-                    if k:
-                        fields[k] = v.strip().strip('"')
-            if fields:
-                self.logger.debug("Fallback KV aplicado", keys=list(fields.keys())[:5])
-                return {"labels": {}, "fields": fields}
-        except Exception:
-            pass
-        # Sem transformação
-        return {"labels": {}, "fields": {"message": line}}

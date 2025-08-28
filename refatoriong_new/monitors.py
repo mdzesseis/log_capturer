@@ -12,6 +12,7 @@ import aiofiles
 import asyncio
 import hashlib
 import re
+import gzip
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone
@@ -20,7 +21,7 @@ from .metrics import metrics
 from .task_manager import task_manager, TaskPriority
 from .config import POSITIONS_DIR, POSITION_SAVE_INTERVAL, DOCKER_LABEL_FILTER_ENABLED, DOCKER_LABEL_FILTER, TASK_HEALTH_CHECK_INTERVAL, DOCKER_CONNECTION_TIMEOUT, DOCKER_CONNECTION_REQUIRED
 from .config import DOCKER_API_RATE_LIMIT, DOCKER_API_BURST_SIZE, DOCKER_CONNECTION_POOL_SIZE, DOCKER_CONNECTION_POOL_MAX_SIZE, DOCKER_METADATA_CACHE_TTL
-from .robustness import StructuredLogger
+from .robustness import StructuredLogger, CorrelationContext
 from .optimization import unified_cleanup_manager  # <--- registrar limpeza de positions
 # NOVO: flags de hot-path logging
 from .config import HOTPATH_DEBUG_ENABLED, HOTPATH_DEBUG_SAMPLE_N
@@ -143,20 +144,42 @@ class FileMonitor:
                 # NOVO: contadores para amostragem de debug
                 read_cnt = 0
                 idle_cnt = 0
+                # NOVO: id curto estável para métricas/labels a partir do caminho
+                source_id_short = hashlib.md5(str(path.resolve()).encode()).hexdigest()[:12]
+                # labels finais base
+                base_labels = {"filepath": str(path), **(labels or {})}
                 while True:
                     line = await f.readline()
                     if line:
                         read_cnt += 1
+                        # Atualiza posição
+                        current_position += len(line.encode("utf-8", errors="ignore"))
+                        # Envia ao dispatcher (sem newline)
+                        try:
+                            await self.dispatcher.handle(
+                                "file",
+                                source_id_short,
+                                line.rstrip("\n"),
+                                base_labels
+                            )
+                        except Exception as e:
+                            self.logger.error("Falha ao despachar linha de arquivo", path=str(path), error=str(e))
                         if HOTPATH_DEBUG_ENABLED and HOTPATH_DEBUG_SAMPLE_N > 0 and (read_cnt % HOTPATH_DEBUG_SAMPLE_N == 0):
                             self.logger.debug("Linha lida do arquivo (amostrado)", path=str(path), task_name=task_name, read_count=read_cnt, line_preview=line[:80])
-                        # ...existing code...
                     else:
                         idle_cnt += 1
                         if HOTPATH_DEBUG_ENABLED and HOTPATH_DEBUG_SAMPLE_N > 0 and (idle_cnt % HOTPATH_DEBUG_SAMPLE_N == 0):
                             self.logger.debug("Nenhuma nova linha (amostrado)", path=str(path), task_name=task_name, idle_count=idle_cnt)
                         await asyncio.sleep(0.5)
-                        # ...existing code...
+                    # Heartbeat periódico
                     now = time.time()
+                    if now - last_hb > TASK_HEALTH_CHECK_INTERVAL / 2:
+                        try:
+                            await task_manager.heartbeat(task_name)
+                        except Exception:
+                            pass
+                        last_hb = now
+                    # Persistência periódica da posição
                     if now - last_save_time > POSITION_SAVE_INTERVAL:
                         await self._save_position(pos_file, current_position)
                         last_save_time = now
@@ -525,14 +548,44 @@ class ContainerMonitor:
             self.logger.info("Monitoramento de container iniciado", task_name=task_name, container=cid[:12], max_concurrent=self.max_concurrent, semaphore_available=available)
             return True
 
-    # NOVO: parar monitoramento de um container
+    # NOVO: parar monitoramento de um container com verificação de segurança
     async def _stop_monitoring_container(self, container_id: str):
+        """Para o monitoramento de um container específico com verificações de segurança"""
         async with self.lock:
             if container_id in self.monitored_containers:
                 task_name = self.monitored_containers[container_id].get("task_name")
+                
+                self.logger.info("Solicitado parar monitoramento do container", container_id=container_id[:12], task_name=task_name)
+                
+                # Verificação de segurança: confirmar se container realmente não existe
+                # CORRIGIDO: Usar método direto em vez de task_manager
+                container_active = False
+                try:
+                    async with self.docker_pool.get_connection() as docker_client:
+                        details = await docker_client.containers.container(container_id).show()
+                        container_active = details.get('State', {}).get('Running', False)
+                except Exception:
+                    # Se não conseguir verificar, assume que não existe
+                    container_active = False
+                
+                if container_active:
+                    self.logger.warning("Container ainda existe! Não removendo task", container_id=container_id[:12], task_name=task_name)
+                    return
+                
+                # Container confirmadamente não existe, prosseguir com remoção
+                self.logger.info("Container confirmadamente removido. Parando monitoramento...", container_id=container_id[:12])
+                
+                # CORRIGIDO: Usar referência ao task_manager
+                from .task_manager import task_manager
+                
+                # Cancelar task se estiver rodando
                 if task_name and task_name in task_manager.tasks:
                     task_manager.tasks[task_name].cancel()
-                self.logger.info("Monitoramento de container parado", task_name=task_name, container=container_id[:12])
+                
+                # Remover do mapa de containers monitorados
+                del self.monitored_containers[container_id]
+                
+                self.logger.info("Monitoramento do container removido completamente", container_id=container_id[:12], task_name=task_name)
 
     # ADAPTADO: persistência de posição (since) por container usando ID completo (com fallback)
     async def _read_container_since(self, container_id: str) -> Optional[int]:
@@ -613,7 +666,11 @@ class ContainerMonitor:
 
     # CORRIGIDO: loop resiliente de tail sem trechos duplicados/fora de bloco
     async def _monitor_container(self, container_id: str):
-        self.logger.debug("Monitorando container", container_id=container_id[:12])
+        # NOVO: Gerar um novo correlation_id para cada container monitorado
+        corr_id = CorrelationContext.generate_correlation_id()
+        CorrelationContext.set_correlation_id(corr_id)
+        
+        self.logger.debug("Monitorando container", container_id=container_id[:12], correlation_id=corr_id)
         task_name = f"container_{container_id[:12]}"
         container_details = {}
         semaphore_acquired = False
@@ -725,9 +782,14 @@ class ContainerMonitor:
                                 dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
                                 current_since = max(current_since or 0, int(dt.timestamp()))
                                 parsed_msg = msg
+                                # NÃO colocar timestamp como label (evita alta cardinalidade no Loki).
+                                # Em vez disso, passar como campo temporário _event_timestamp para o dispatcher extrair e remover.
+                                labels_with_ts = {**labels, "_event_timestamp": dt.isoformat()}
                             except Exception:
                                 current_since = max(current_since or 0, int(time.time()))
-                            await self.dispatcher.handle("docker", container_id[:12], parsed_msg.strip(), labels)
+                                labels_with_ts = labels
+                                parsed_msg = line
+                            await self.dispatcher.handle("docker", container_id[:12], parsed_msg.strip(), labels_with_ts)
 
                             now_ts = time.time()
                             if now_ts - last_save_time > POSITION_SAVE_INTERVAL and current_since is not None:
@@ -809,3 +871,103 @@ class ContainerMonitor:
             except Exception as e:
                 self.logger.error("Erro ao liberar semáforo", task_name=task_name, error=str(e))
             self.logger.info("Monitoramento do container finalizado", task_name=task_name, container=container_id[:12])
+
+    async def _process_file(self, processing_file: Path, target_file: Path, labels: dict):
+        """
+        Processa um arquivo de log: lê, comprime se necessário, e despacha o conteúdo.
+        Suporta arquivos .jsonl.gz, .jsonl.zst, .jsonl.lz4 e .jsonl (texto puro).
+        """
+        self.logger.info("Processando arquivo de log", arquivo=str(processing_file))
+        # Lê o arquivo de acordo com o tipo/compressão
+        try:
+            content = ""
+            if target_file.endswith('.jsonl.gz'):
+                def _read_gz_sync(p: str) -> str:
+                    with gzip.open(p, 'rt', encoding='utf-8') as f:
+                        return f.read()
+                content = await asyncio.to_thread(_read_gz_sync, processing_file)
+            elif target_file.endswith('.jsonl.zst'):
+                def _read_zst_sync(p: str) -> str:
+                    import zstd
+                    with open(p, 'rb') as f:
+                        data = zstd.decompress(f.read())
+                        return data.decode('utf-8')
+                content = await asyncio.to_thread(_read_zst_sync, processing_file)
+            elif target_file.endswith('.jsonl.lz4'):
+                def _read_lz4_sync(p: str) -> str:
+                    import lz4.frame as lz4f
+                    with lz4f.open(p, 'rb') as f:
+                        data = f.read()
+                        return data.decode('utf-8')
+                content = await asyncio.to_thread(_read_lz4_sync, processing_file)
+            else:
+                async with aiofiles.open(processing_file, 'r', encoding='utf-8') as f:
+                    content = await f.read()
+            # Despacha o conteúdo lido
+            if content:
+                await self.dispatcher.handle("file", "file_processor", content, labels)
+        except Exception as e:
+            self.logger.error("Erro ao processar arquivo", arquivo=str(processing_file), error=str(e))
+        finally:
+            # Tenta remover o arquivo processado
+            try:
+                if processing_file.exists():
+                    os.remove(str(processing_file))
+                    self.logger.info("Arquivo processado removido", arquivo=str(processing_file))
+            except Exception as e:
+                self.logger.warning("Erro ao remover arquivo processado", arquivo=str(processing_file), error=str(e))
+
+    async def _maybe_rotate_file(self, file_path: str, pending_bytes: int = 0):
+        """
+        Se o arquivo alvo exceder o limite (tamanho atual + bytes pendentes), faz rotação
+        e comprime o rotacionado de forma assíncrona (zstd|lz4|gzip conforme config).
+        """
+        try:
+            p = Path(file_path)
+            if self.max_file_size_bytes <= 0 or not p.exists():
+                return
+            current_size = p.stat().st_size
+            if current_size + max(0, pending_bytes) <= self.max_file_size_bytes:
+                return
+            ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+            base = p.name
+            dirp = p.parent
+            idx = 0
+            rotated = dirp / f"{base}.{ts}.{idx}"
+            while rotated.exists():
+                idx += 1
+                rotated = dirp / f"{base}.{ts}.{idx}"
+            os.rename(str(p), str(rotated))
+            self.logger.info("Arquivo local rotacionado", original=file_path, rotated=str(rotated), size_bytes=current_size)
+            ext = ".zst" if DISK_BUFFER_COMPRESSION_ALGO in ("zstd", "zst") else (".lz4" if DISK_BUFFER_COMPRESSION_ALGO == "lz4" else ".gz")
+            dst = rotated.with_suffix(rotated.suffix + ext)
+            def _compress_sync(src: Path, dst: Path):
+                algo = DISK_BUFFER_COMPRESSION_ALGO
+                level = int(DISK_BUFFER_COMPRESSION_LEVEL)
+                try:
+                    with open(src, 'rb') as fin:
+                        if algo == 'zstd' or algo == 'zst':
+                            import zstd
+                            compressed = zstd.compress(fin.read(), level=level)
+                            with open(dst, 'wb') as fout:
+                                fout.write(compressed)
+                        elif algo == 'lz4':
+                            import lz4.frame
+                            with lz4.frame.open(dst, 'wb', compression_level=level) as fout:
+                                fout.write(fin.read())
+                        else:
+                            import gzip
+                            with gzip.open(dst, 'wb', compresslevel=level) as fout:
+                                fout.write(fin.read())
+                    # Remove original se compressão sucedeu
+                    if dst.exists() and dst.stat().st_size > 0:
+                        src.unlink()
+                except Exception as e:
+                    self.logger.error(f"Erro ao comprimir arquivo: {str(e)}")
+                    pass
+            try:
+                asyncio.create_task(asyncio.to_thread(_compress_sync, rotated, dst))
+            except Exception:
+                pass
+        except Exception as e:
+            self.logger.error("Falha na rotação de arquivo", file=file_path, error=str(e))

@@ -1,16 +1,15 @@
 """
 config.py - Configuração central do agente de monitoramento.
 - Carrega variáveis de ambiente e define diretórios, portas, sinks, processamento, robustez.
-- Facilita modo debug e single-file para testes rápidos.
+- Facilita modo debug para testes rápidos.
 """
 
 import os
 import logging
 from pathlib import Path
 
-# Facilitar modo debug/single-file para testes
+# Facilitar modo debug para testes
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
-SINGLE_FILE_MODE = os.getenv("SINGLE_FILE_MODE", "false").lower() == "true"
 
 logging.basicConfig(
     level=logging.DEBUG if DEBUG_MODE else logging.INFO,
@@ -21,7 +20,6 @@ logging.basicConfig(
 BASE_DIR = Path(os.getenv("LOG_CAPTURER_DIR", "/logs"))
 API_PORT = int(os.getenv("API_PORT", 8080))
 METRICS_PORT = int(os.getenv("METRICS_PORT", 8001))
-HEALTH_PORT = int(os.getenv("HEALTH_PORT", 8002))
 
 # Docker
 DOCKER_LABEL_FILTER_ENABLED = os.getenv("DOCKER_LABEL_FILTER_ENABLED", "false").lower() == "true"
@@ -61,7 +59,7 @@ TASK_MAX_RESTARTS_PER_HOUR = int(os.getenv("TASK_MAX_RESTARTS_PER_HOUR", "10"))
 TASK_CIRCUIT_BREAKER_DURATION = int(os.getenv("TASK_CIRCUIT_BREAKER_DURATION", "1800"))
 
 TASK_RESTART_ENABLED = os.getenv("TASK_RESTART_ENABLED", "true").lower() == "true"
-TASK_MAX_RESTART_COUNT = int(os.getenv("TASK_MAX_RESTART_COUNT", "5"))
+TASK_MAX_RESTART_COUNT = int(os.getenv("TASK_MAX_RESTART_COUNT", "7"))  # Aumentado para 7
 TASK_RESTART_BACKOFF_BASE = float(os.getenv("TASK_RESTART_BACKOFF_BASE", "2.0"))
 TASK_HEALTH_CHECK_INTERVAL = int(os.getenv("TASK_HEALTH_CHECK_INTERVAL", "30"))
 
@@ -158,6 +156,8 @@ LOCAL_SINK_RETENTION_DAYS = int(os.getenv("LOCAL_SINK_RETENTION_DAYS", "7"))
 # NOVO: limite do buffer local e limpeza proativa
 LOCAL_SINK_MAX_SIZE_MB = int(os.getenv("LOCAL_SINK_MAX_SIZE_MB", "256"))
 PROACTIVE_CLEANUP_ENABLED = os.getenv("PROACTIVE_CLEANUP_ENABLED", "true").lower() == "true"
+# NOVO: rotação por tamanho (MB) para arquivos finais da LocalFileSink
+LOCAL_SINK_MAX_FILE_SIZE_MB = int(os.getenv("LOCAL_SINK_MAX_FILE_SIZE_MB", "32"))
 
 # Controle global do monitoramento de arquivos
 FILE_MONITOR_ENABLED = os.getenv("FILE_MONITOR_ENABLED", "true").lower() == "true"
@@ -167,9 +167,45 @@ SELF_ID_SHORT = os.getenv("HOSTNAME", "")[:12]
 SELF_CONTAINER_NAME = os.getenv("SELF_CONTAINER_NAME", "log_capturer")
 SELF_FEEDBACK_GUARD = os.getenv("SELF_FEEDBACK_GUARD", "true").lower() == "true"
 
+# NOVO: Configurações para limpeza de tasks com verificação de segurança
+ORPHANED_TASK_CLEANUP_INTERVAL = int(os.getenv("ORPHANED_TASK_CLEANUP_INTERVAL", "300"))  # 5 minutos
+
+# NOVO: Configuração inteligente do Docker Socket
+def _get_docker_socket_url():
+    """Detecta socket Docker sem causar import circular"""
+    # 1. DOCKER_HOST (padrão Docker)
+    docker_host = os.getenv("DOCKER_HOST")
+    if docker_host:
+        return docker_host.replace("tcp://", "http://") if docker_host.startswith("tcp://") else docker_host
+    # 2. DOCKER_SOCKET_URL (nossa configuração)
+    socket_url = os.getenv("DOCKER_SOCKET_URL")
+    if socket_url:
+        return socket_url
+    # 3. Socket Unix padrão
+    unix_socket = "/var/run/docker.sock"
+    if Path(unix_socket).exists():
+        return f"unix://{unix_socket}" 
+    # 4. Fallback
+    return "http://localhost:2375"
+
+DOCKER_SOCKET_URL = _get_docker_socket_url()
+
+# Permite override manual se necessário
+DOCKER_SOCKET_URL_OVERRIDE = os.getenv("DOCKER_SOCKET_URL_OVERRIDE")
+if DOCKER_SOCKET_URL_OVERRIDE:
+    DOCKER_SOCKET_URL = DOCKER_SOCKET_URL_OVERRIDE
+
 # Dirs necessários
 for dir_path in [BASE_DIR, LOKI_BUFFER_DIR, ELASTICSEARCH_BUFFER_DIR, SPLUNK_BUFFER_DIR, BASE_DIR / "dlq", POSITIONS_DIR]:
     try:
         dir_path.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
+    except Exception:
+        pass
+
+# NOVO: política de retry/backoff para batches persistidos (recovery)
+SINK_PERSISTENCE_ENABLED = os.getenv("SINK_PERSISTENCE_ENABLED", "true").lower() == "true"
+SINK_PERSISTENCE_RECOVERY_MAX_RETRIES = int(os.getenv("SINK_PERSISTENCE_RECOVERY_MAX_RETRIES", "10"))
+SINK_PERSISTENCE_RECOVERY_BACKOFF_BASE = float(os.getenv("SINK_PERSISTENCE_RECOVERY_BACKOFF_BASE", "1.0"))  # segundos
+SINK_PERSISTENCE_RECOVERY_BACKOFF_MAX = float(os.getenv("SINK_PERSISTENCE_RECOVERY_BACKOFF_MAX", "30.0"))  # segundos

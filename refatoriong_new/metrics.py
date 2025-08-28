@@ -87,6 +87,14 @@ class Metrics:
         self._cpu_prev_usage_ns = None
         self._cpu_limit_cpus = None
 
+        # NOVO: Métricas ausentes referenciadas no código
+        self.SINK_BATCHES_PROCESSED = Gauge("log_capturer_sink_batches_processed_total", "Batches processed by sink", ["sink_name"])
+        self.SINK_BATCHES_FAILED = Gauge("log_capturer_sink_batches_failed_total", "Batches failed by sink", ["sink_name"])
+        self.SINK_LOGS_WRITTEN = Gauge("log_capturer_sink_logs_written_total", "Logs written by sink", ["sink_name"])
+        self.SINK_LOGS_SENT = Gauge("log_capturer_sink_logs_sent_total", "Logs sent by sink", ["sink_name"])
+        self.SINK_RECOVERY_OPERATIONS = Gauge("log_capturer_sink_recovery_operations_total", "Recovery operations by sink", ["sink_name"])
+        self.SINK_PERSISTENCE_OPERATIONS = Gauge("log_capturer_sink_persistence_operations_total", "Persistence operations by sink", ["sink_name"])
+        
     # NOVO: leitura de cgroup v2 de memória
     def _read_cgroup_v2_memory(self):
         base = Path("/sys/fs/cgroup")

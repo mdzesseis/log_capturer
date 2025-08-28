@@ -1,0 +1,32 @@
+version: "3.8"
+
+volumes:
+  prometheus-data:
+    driver: local-persist
+    driver_opts:
+      mountpoint: /var/log/monitoring_data_suite/prometheus-data
+
+  grafana-data:
+    driver: local-persist
+    driver_opts:
+      mountpoint: /var/log/monitoring_data_suite/grafana-data
+
+  loki-data:
+    driver: local-persist
+    driver_opts:
+      mountpoint: /var/log/monitoring_data_suite/loki-data
+
+  agent-logs:
+    driver: local-persist
+    driver_opts:
+      mountpoint: /var/log/monitoring_data_suite/agent-logs
+
+  loki-monitoring:
+    driver: local-persist
+    driver_opts:
+      mountpoint: /var/log/monitoring_data_suite/loki-monitoring
+
+  test-logs:
+    driver: local-persist
+    driver_opts:
+      mountpoint: /var/log/monitoring_data_suite/test-logs

@@ -1,0 +1,903 @@
+apiVersion: 1
+contactPoints:
+- orgId: 1
+  name: google-chat-webhook
+  receivers:
+  - uid: aewamuyshvc3kf
+    type: googlechat
+    settings:
+      message: '{{ template "msteams.default.text" . }}'
+      title: '{{ template "msteams.default.title" . }}'
+      url: https://chat.googleapis.com/v1/spaces/AAQAbJavLk0/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=3_8EjENXcE9iwU_8bTT7qzXBKSB9rU3Igtkj0u-5kXI
+    disableResolveMessage: false
+notificationPolicies:
+- orgId: 1
+  receiver: google-chat-webhook
+  group_by:
+  - alertname
+  matchers:
+  - severity=~".*"
+groups:
+- orgId: 1
+  name: LogCapturerCriticalAlerts
+  folder: Default
+  interval: 1m
+  rules:
+  - uid: logcapturerdown
+    title: LogCapturerDown
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: up{job="log_capturer"} == 0
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 1m
+    annotations:
+      summary: Log Capturer agent is down
+      description: The log-capturer instance {{ $labels.instance }} is down.
+  - uid: logcapturertaskshealthdegraded
+    title: LogCapturerTasksHealthDegraded
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: avg(log_capturer_task_health) < 0.7
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: Log Capturer tasks health is degraded
+      description: Average task health is {{ $value | humanizePercentage }}, below threshold.
+  - uid: logcapturercircuitbreakeropen
+    title: LogCapturerCircuitBreakerOpen
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: log_capturer_circuit_breaker_state == 1
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 2m
+    annotations:
+      summary: Circuit breaker is open
+      description: Circuit breaker {{ $labels.breaker_name }} is open, blocking requests.
+- orgId: 1
+  name: LogCapturerResourceAlerts
+  folder: Default
+  interval: 1m
+  rules:
+  - uid: logcapturersinkqueuehigh
+    title: LogCapturerSinkQueueHigh
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: log_capturer_sink_queue_size{job="log_capturer"} > 4500
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: Log Capturer sink queue is almost full
+      description: The sink '{{ $labels.sink_name }}' has a queue size of {{ $value | humanize }} which is over 90% of capacity.
+  - uid: logcapturerhighdiskbuffer
+    title: LogCapturerHighDiskBuffer
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: log_capturer_sink_disk_buffer_size_bytes{job="log_capturer"} > 1073741824
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 10m
+    annotations:
+      summary: Log Capturer disk buffer is large
+      description: The sink '{{ $labels.sink_name }}' has a disk buffer size of {{ $value | humanize }} bytes.
+  - uid: logcapturerhighmemoryusage
+    title: LogCapturerHighMemoryUsage
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: log_capturer_system_mem_bytes > 2147483648
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 10m
+    annotations:
+      summary: High memory usage
+      description: Memory usage is {{ $value | humanize1024 }}, above 2GB threshold.
+- orgId: 1
+  name: LogCapturerTaskAlerts
+  folder: Default
+  interval: 1m
+  rules:
+  - uid: logcapturertaskunhealthy
+    title: LogCapturerTaskUnhealthy
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: log_capturer_task_health == 0
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 3m
+    annotations:
+      summary: Log Capturer task is unhealthy
+      description: Task {{ $labels.task_name }} is marked as unhealthy.
+  - uid: logcapturerhightaskrestarts
+    title: LogCapturerHighTaskRestarts
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: increase(log_capturer_task_restarts_total[1h]) > 5
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: High task restart rate
+      description: Task {{ $labels.task_name }} has restarted {{ $value }} times in the last hour.
+- orgId: 1
+  name: LogCapturerPerformanceAlerts
+  folder: Default
+  interval: 1m
+  rules:
+  - uid: logcapturerhighprocessingtime
+    title: LogCapturerHighProcessingTime
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: rate(log_capturer_processing_time_seconds_sum[5m]) / rate(log_capturer_processing_time_seconds_count[5m]) > 1.0
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 10m
+    annotations:
+      summary: High log processing time
+      description: Average processing time for {{ $labels.source_type }}/{{ $labels.source_id }} is {{ $value | humanizeDuration }}.
+  - uid: logcapturerhighthrottlingdelay
+    title: LogCapturerHighThrottlingDelay
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: rate(log_capturer_throttling_delay_seconds_sum[5m]) / rate(log_capturer_throttling_delay_seconds_count[5m]) > 2.0
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: High throttling delays
+      description: Average throttling delay for {{ $labels.sink_name }} is {{ $value | humanizeDuration }}.
+- orgId: 1
+  name: LogCapturerHTTPSessionAlerts
+  folder: Default
+  interval: 1m
+  rules:
+  - uid: logcapturerhttpsessionpoolexhausted
+    title: LogCapturerHTTPSessionPoolExhausted
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: log_capturer_http_session_pool_available == 0
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 2m
+    annotations:
+      summary: HTTP session pool exhausted
+      description: No HTTP sessions available in the pool, requests may be blocked.
+- orgId: 1
+  name: loki_storage_alerts
+  folder: Default
+  interval: 1m
+  rules:
+  - uid: lokidatasizehigh
+    title: LokiDataSizeHigh
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: loki_data_size_gb > 4
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: Loki data size approaching limit
+      description: Loki data size is {{ $value }}GB, approaching the 5GB limit
+  - uid: lokidatasizecritical
+    title: LokiDataSizeCritical
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: loki_data_size_gb > 4.5
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 2m
+    annotations:
+      summary: Loki data size critical
+      description: Loki data size is {{ $value }}GB, very close to the 5GB limit
+  - uid: lokicompactionfailing
+    title: LokiCompactionFailing
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: increase(loki_compactor_runs_failed_total[1h]) > 0
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: Loki compaction failing
+      description: Loki compaction has failed {{ $value }} times in the last hour
+  - uid: lokistorageusagehigh
+    title: LokiStorageUsageHigh
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: loki_usage_percent > 80
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 10m
+    annotations:
+      summary: Loki storage usage high
+      description: Loki storage usage is {{ $value }}% of the configured limit
+  - uid: lokistorageusagecritical
+    title: LokiStorageUsageCritical
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: loki_usage_percent > 90
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: Loki storage usage critical
+      description: Loki storage usage is {{ $value }}% of the configured limit, cleanup may be triggered
+  - uid: lokimetricsunavailable
+    title: LokiMetricsUnavailable
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: loki_metrics_available == 0
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 15m
+    annotations:
+      summary: Loki storage metrics unavailable
+      description: Loki storage monitoring script is not generating metrics
+- orgId: 1
+  name: node_exporter_alerts
+  folder: Default
+  interval: 1m
+  rules:
+  - uid: nodedown
+    title: NodeDown
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: up{job="node"} == 0
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 2m
+    annotations:
+      summary: "Node Exporter está down"
+      description: "Node Exporter na instância {{ $labels.instance }} está indisponível por mais de 2 minutos."
+  - uid: highcpuusage
+    title: HighCPUUsage
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: 100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: Alto uso de CPU
+      description: "CPU usage está em {{ $value }}% na instância {{ $labels.instance }}"
+  - uid: highmemoryusage
+    title: HighMemoryUsage
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: "Alto uso de memória"
+      description: "Uso de memória está em {{ $value }}% na instância {{ $labels.instance }}"
+  - uid: highdiskusage
+    title: HighDiskUsage
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: (1 - (node_filesystem_avail_bytes{fstype!="tmpfs"} / node_filesystem_size_bytes{fstype!="tmpfs"})) * 100 > 85
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: Alto uso de disco
+      description: "Uso do disco {{ $labels.mountpoint }} está em {{ $value }}% na instância {{ $labels.instance }}"
+  - uid: highloadaverage
+    title: HighLoadAverage
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: node_load15 > 2
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 10m
+    annotations:
+      summary: Load average alto
+      description: "Load average de 15min está em {{ $value }} na instância {{ $labels.instance }}"
+- orgId: 1
+  name: mysql_alerts
+  folder: Default
+  interval: 1m
+  rules:
+  - uid: mysqldown
+    title: MySQLDown
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: mysql_up == 0
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 1m
+    annotations:
+      summary: "MySQL está down"
+      description: "MySQL na instância {{ $labels.instance }} está indisponível."
+  - uid: mysqlhighconnections
+    title: MySQLHighConnections
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: (mysql_global_status_threads_connected / mysql_global_variables_max_connections) * 100 > 80
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: "Alto número de conexões MySQL"
+      description: "Conexões MySQL estão em {{ $value }}% do limite na instância {{ $labels.instance }}"
+  - uid: mysqlslowqueries
+    title: MySQLSlowQueries
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: rate(mysql_global_status_slow_queries[5m]) > 5
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 2m
+    annotations:
+      summary: Muitas queries lentas no MySQL
+      description: "{{ $value }} queries lentas por segundo na instância {{ $labels.instance }}"
+  - uid: mysqlinnodbbufferefficiency
+    title: MySQLInnoDBBufferEfficiency
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: (mysql_global_status_innodb_buffer_pool_reads / mysql_global_status_innodb_buffer_pool_read_requests) * 100 > 5
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: "Baixa eficiência do buffer pool InnoDB"
+      description: "Buffer pool hit ratio está baixo ({{ $value }}%) na instância {{ $labels.instance }}"
+- orgId: 1
+  name: opensips_alerts
+  folder: Default
+  interval: 1m
+  rules:
+  - uid: opensipsdown
+    title: OpenSIPSDown
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: up{job="opensips"} == 0
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 1m
+    annotations:
+      summary: "OpenSIPS Exporter está down"
+      description: "OpenSIPS Exporter na instância {{ $labels.instance }} está indisponível."
+  - uid: opensipshighcallrate
+    title: OpenSIPSHighCallRate
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: rate(opensips_core_rcv_requests_total[5m]) > 100
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: Alta taxa de chamadas no OpenSIPS
+      description: "Taxa de requests está em {{ $value }}/s na instância {{ $labels.instance }}"
+  - uid: opensipshigherrorrate
+    title: OpenSIPSHighErrorRate
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: rate(opensips_core_err_requests_total[5m]) > 10
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 2m
+    annotations:
+      summary: Alta taxa de erros no OpenSIPS
+      description: "Taxa de erros está em {{ $value }}/s na instância {{ $labels.instance }}"
+- orgId: 1
+  name: cadvisor_alerts
+  folder: Default
+  interval: 1m
+  rules:
+  - uid: containerdown
+    title: ContainerDown
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: rate(container_last_seen[5m]) == 0
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 1m
+    annotations:
+      summary: "Container parou de reportar métricas"
+      description: "Container {{ $labels.name }} na instância {{ $labels.instance }} não está reportando métricas"
+  - uid: containerhighcpu
+    title: ContainerHighCPU
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: rate(container_cpu_usage_seconds_total[5m]) * 100 > 80
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: Alto uso de CPU no container
+      description: "Container {{ $labels.name }} está usando {{ $value }}% de CPU"
+  - uid: containerhighmemory
+    title: ContainerHighMemory
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: (container_memory_usage_bytes / container_spec_memory_limit_bytes) * 100 > 85
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: "Alto uso de memória no container"
+      description: "Container {{ $labels.name }} está usando {{ $value }}% da memória disponível"
+  - uid: containerrestartloop
+    title: ContainerRestartLoop
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: rate(container_start_time_seconds[15m]) > 0
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: Container em loop de restart
+      description: "Container {{ $labels.name }} está reiniciando frequentemente"
+- orgId: 1
+  name: docker_state_alerts
+  folder: Default
+  interval: 1m
+  rules:
+  - uid: dockerstateexporterdown
+    title: DockerStateExporterDown
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: up{job="docker_state"} == 0
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 2m
+    annotations:
+      summary: "Docker State Exporter está down"
+      description: "Docker State Exporter na instância {{ $labels.instance }} está indisponível."
+  - uid: toomanyunhealthycontainers
+    title: TooManyUnhealthyContainers
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        expr: count(docker_container_health_status{status!="healthy"}) > 3
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: "Muitos containers não saudáveis"
+      description: "{{ $value }} containers estão em estado não saudável"
+# Adicione ao arquivo alerts.yml
+- orgId: 1
+  name: loki_log_based_alerts
+  folder: Default
+  interval: 1m
+  rules:
+  - uid: higherrormessages
+    title: HighErrorMessages
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: loki # Altere para o UID do seu datasource Loki
+      model:
+        expr: 'count_over_time({job="your_app"} |~ "ERROR|Exception|Fatal" [5m]) > 10'
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: OK
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: Alto número de mensagens de erro
+      description: '{{ $value }} mensagens de erro detectadas nos últimos 5 minutos'
+
+  - uid: highlatencylogs
+    title: HighLatencyLogs
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: loki
+      model:
+        expr: 'avg_over_time({job="your_app"} |~ "request_time" | regexp "request_time=(?P<time>\\d+)" | unwrap time [5m]) > 1000'
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: OK
+    execErrState: Error
+    for: 10m
+    annotations:
+      summary: Alta latência em requisições
+      description: 'Latência média de {{ $value }}ms detectada nos últimos 5 minutos'
+
+  - uid: authenticationfailures
+    title: AuthenticationFailures
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: loki
+      model:
+        expr: 'count_over_time({job="auth_service"} |~ "Authentication failed|Invalid credentials" [5m]) > 5'
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: OK
+    execErrState: Error
+    for: 2m
+    annotations:
+      summary: Múltiplas falhas de autenticação
+      description: '{{ $value }} falhas de autenticação detectadas nos últimos 5 minutos'
+
+  - uid: servicerestarts
+    title: ServiceRestarts
+    condition: A
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: loki
+      model:
+        expr: 'count_over_time({job~".*"} |~ "Started application|Application ready|Restart " [15m]) > 3'
+        instant: false
+        interval: ''
+        legendFormat: ''
+        refId: A
+    noDataState: OK
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: Múltiplos reinícios de serviço
+      description: '{{ $value }} reinícios de serviço detectados nos últimos 15 minutos'

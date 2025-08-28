@@ -18,6 +18,9 @@ from .config import SELF_ID_SHORT, SELF_CONTAINER_NAME, SELF_FEEDBACK_GUARD
 from .config import TIMESTAMP_MAX_PAST_AGE_SECONDS, TIMESTAMP_MAX_FUTURE_AGE_SECONDS
 # NOVO: toggle do clamp
 from .config import TIMESTAMP_CLAMP_ENABLED
+# NOVO: importar DLQ_ENABLED
+from .config import DLQ_ENABLED
+from .config import TIMESTAMP_CLAMP_DLQ
 
 class LogDispatcher:
     """
@@ -59,8 +62,17 @@ class LogDispatcher:
             processed_labels = processed_data.get('labels', {})
             log_fields = processed_data.get('fields', {})
 
-            # Labels finais: base + processadas
-            final_labels = {**base_labels, **processed_labels}
+            # Extrai timestamp do evento passado pelo monitor (se existir) e remove chave interna
+            event_ts_iso = None
+            try:
+                # _event_timestamp é definido pelo monitor quando há timestamp ISO no stream
+                event_ts_iso = base_labels.pop("_event_timestamp", None)
+            except Exception:
+                event_ts_iso = None
+
+            # Labels finais: base_labels filtrado (remove chaves internas que começam com '_') + processadas
+            base_labels_filtered = {k: v for k, v in base_labels.items() if not (str(k).startswith("_") or k == "timestamp")}
+            final_labels = {**base_labels_filtered, **processed_labels}
 
             # Lógica explícita de labels 'job'
             if source_type == "docker":
@@ -79,35 +91,81 @@ class LogDispatcher:
             if 'message' not in log_fields:
                 log_fields['message'] = line
 
-            # Timestamp: usa do campo ou atual
+            # Timestamp: prioridade: log_fields['timestamp'] -> event_ts_iso (do monitor) -> agora
             log_ts = int(time.time() * 1e9)
+            # 1) se o processor já forneceu 'timestamp' em fields, usa e remove-o das fields (mas manterá como field)
             if 'timestamp' in log_fields:
                 try:
-                    ts_str = log_fields.pop('timestamp')
-                    dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                    ts_str = log_fields.get('timestamp')
+                    dt = datetime.fromisoformat(str(ts_str).replace('Z', '+00:00'))
                     log_ts = int(dt.timestamp() * 1e9)
+                    # manter timestamp como FIELD (já está em log_fields)
                 except Exception:
                     if not self._is_self_source(source_type, source_id, base_labels):
-                        self.logger.warning("Falha ao converter timestamp, usando atual", ts_str=ts_str)
+                        self.logger.warning("Falha ao converter timestamp fornecido, usando atual", ts_str=ts_str)
                     else:
                         self.logger.debug("Falha ao converter timestamp (self) - suprimido", ts_str=ts_str)
+            # 2) se o monitor forneceu _event_timestamp, converte e garante que fique em log_fields como field (ISO)
+            elif event_ts_iso:
+                try:
+                    dt = datetime.fromisoformat(event_ts_iso.replace('Z', '+00:00'))
+                    log_ts = int(dt.timestamp() * 1e9)
+                    # Coloca o timestamp como field (ISO) para envio no payload (evita enviar como label)
+                    try:
+                        # manter formato ISO para fields; sinks usam 'ts' numeric para protocolos externos
+                        log_fields['timestamp'] = dt.isoformat()
+                    except Exception:
+                        pass
+                except Exception:
+                    # se falhar, usa now e segue sem DLQ
+                    log_ts = int(time.time() * 1e9)
 
             # NOVO: clamp de timestamp (passado/futuro) para evitar rejeição no Loki
             now_ns = int(time.time() * 1e9)
             max_past_ns = TIMESTAMP_MAX_PAST_AGE_SECONDS * 1_000_000_000
             max_future_ns = TIMESTAMP_MAX_FUTURE_AGE_SECONDS * 1_000_000_000
+            out_of_range = (log_ts < now_ns - max_past_ns) or (log_ts > now_ns + max_future_ns)
             if TIMESTAMP_CLAMP_ENABLED:
                 if log_ts < now_ns - max_past_ns:
                     if not self._is_self_source(source_type, source_id, base_labels):
-                        self.logger.warning("Timestamp muito antigo; ajustando para agora", ts_original=log_ts, drift_seconds=int((now_ns - log_ts)/1e9))
+                        self.logger.warning(
+                            "Timestamp muito antigo; ajustando para agora",
+                            source_type=source_type,
+                            source_id=source_id,
+                            container_name=base_labels.get("container_name", "unknown"),
+                            ts_original=log_ts,
+                            drift_seconds=int((now_ns - log_ts)/1e9)
+                        )
                     log_ts = now_ns
                 elif log_ts > now_ns + max_future_ns:
                     if not self._is_self_source(source_type, source_id, base_labels):
-                        self.logger.warning("Timestamp no futuro; ajustando para agora", ts_original=log_ts, drift_seconds=int((log_ts - now_ns)/1e9))
+                        self.logger.warning(
+                            "Timestamp no futuro; ajustando para agora",
+                            source_type=source_type,
+                            source_id=source_id,
+                            container_name=base_labels.get("container_name", "unknown"),
+                            ts_original=log_ts,
+                            drift_seconds=int((log_ts - now_ns)/1e9)
+                        )
                     log_ts = now_ns
             else:
-                # Ajuste desabilitado via configuração; preservar timestamp original
-                self.logger.debug("Clamp de timestamp desabilitado por configuração", clamp_enabled=False)
+                # Clamp desabilitado: descartar entradas fora da janela (não mandar para DLQ).
+                if out_of_range:
+                    # Conta como drop/instrumenta para visibilidade, mas evita inundar DLQ.
+                    try:
+                        metrics.PROCESSING_DROPPED.inc()
+                    except Exception:
+                        pass
+                    self.logger.warning(
+                        "Timestamp fora da janela e clamp desabilitado; descartando",
+                        ts_original=log_ts
+                    )
+                    return
+                else:
+                    self.logger.debug(
+                        "Clamp de timestamp desabilitado por configuração",
+                        clamp_enabled=False
+                    )
 
             record = {
                 "ts": log_ts,
@@ -131,35 +189,56 @@ class LogDispatcher:
                 metrics.BYTES_PROCESSED.labels(source_type=source_type, source_id=source_id, source_name=source_name_label).inc(len(line))
             except Exception as e:
                 # Fallback robusto: DLQ local
-                record['meta']['is_dlq'] = True
-                record['meta']['dlq_reason'] = str(e)
-                if "localfile" in self.sinks:
-                    await self.sinks["localfile"].send(record)
-                metrics.LOGS_DLQ.labels(source_type=source_type, reason="sink_error").inc()
+                # NOVO: Verificar DLQ_ENABLED
+                if DLQ_ENABLED:
+                    record['meta']['is_dlq'] = True
+                    record['meta']['dlq_reason'] = str(e)
+                    if "localfile" in self.sinks:
+                        await self.sinks["localfile"].send(record)
+                # Em caso de erro de sink, ainda contabiliza DLQ para sink_error
+                try:
+                    metrics.LOGS_DLQ.labels(source_type=source_type, reason="sink_error").inc()
+                except Exception:
+                    pass
                 if not self._is_self_source(source_type, source_id, base_labels):
-                    self.logger.error("Erro ao enviar para sink, enviado para DLQ", error=str(e))
+                    self.logger.error(
+                        "Erro ao enviar para sink, enviado para DLQ",
+                        error=str(e)
+                    )
                 else:
-                    self.logger.debug("Erro ao enviar para sink (self) - suprimido; enviado para DLQ", error=str(e))
+                    self.logger.debug(
+                        "Erro ao enviar para sink (self) - suprimido; enviado para DLQ",
+                        error=str(e)
+                    )
         except Exception as e:
             # Fallback global: DLQ local
-            dlq_record = {
-                "ts": int(time.time() * 1e9),
-                "line": line,
-                "labels": base_labels,
-                "meta": {
-                    "source_type": source_type,
-                    "source_id": source_id,
-                    "is_dlq": True,
-                    "dlq_reason": f"processing_error: {str(e)}"
+            # NOVO: Verificar DLQ_ENABLED
+            if DLQ_ENABLED:
+                dlq_record = {
+                    "ts": int(time.time() * 1e9),
+                    "line": line,
+                    "labels": base_labels,
+                    "meta": {
+                        "source_type": source_type,
+                        "source_id": source_id,
+                        "is_dlq": True,
+                        "dlq_reason": f"processing_error: {str(e)}"
+                    }
                 }
-            }
-            if "localfile" in self.sinks:
-                await self.sinks["localfile"].send(dlq_record)
+                if "localfile" in self.sinks:
+                    await self.sinks["localfile"].send(dlq_record)
+                    
             metrics.LOGS_DLQ.labels(source_type=source_type, reason="processing_error").inc()
             if not self._is_self_source(source_type, source_id, base_labels):
-                self.logger.error("Erro global no dispatcher, enviado para DLQ", error=str(e))
+                self.logger.error(
+                    "Erro global no dispatcher, enviado para DLQ",
+                    error=str(e)
+                )
             else:
-                self.logger.debug("Erro global no dispatcher (self) - suprimido; enviado para DLQ", error=str(e))
+                self.logger.debug(
+                    "Erro global no dispatcher (self) - suprimido; enviado para DLQ",
+                    error=str(e)
+                )
 
     async def start(self):
         """Inicializa dispatcher (placeholder)."""

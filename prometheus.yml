@@ -4,14 +4,13 @@ global:
   external_labels:
     cluster: 'log-capturer-cluster'
 
-rule_files:
-- /etc/prometheus/rules.yml
+# rule_files:
+# - /etc/prometheus/rules.yml
 
-alerting:
-  alertmanagers:
-  - static_configs:
-    - targets:
-      - alertmanager:9093
+# alerting:
+#   alertmanagers:
+#   - static_configs:
+#     - targets: [ 'alertmanager:9093' ]
 
 scrape_configs:
 - job_name: 'prometheus'
@@ -36,7 +35,58 @@ scrape_configs:
   - targets: [ 'loki:3100' ]
   scrape_interval: 30s
 
-- job_name: 'alertmanager'
+# - job_name: 'alertmanager'
+#   static_configs:
+#   - targets: [ 'alertmanager:9093' ]
+#   scrape_interval: 30s
+
+# NOVO: Job para coletar métricas do sidecar do Loki
+- job_name: 'loki_storage_monitor'
   static_configs:
-  - targets: [ 'alertmanager:9093' ]
+  - targets: [ 'loki-monitor:9091' ]
+  scrape_interval: 60s
+  metrics_path: /metrics
+  # # NOVO: Alternativa via file-based service discovery
+  # - job_name: 'loki_storage_textfile'
+  #   static_configs:
+  #   - targets: [ 'log_capturer:8001' ]
+  #   scrape_interval: 60s
+  #   metrics_path: /loki-storage-metrics
+  # Node Exporter - métricas do sistema
+- job_name: 'node'
+  static_configs:
+  - targets: [ 'node_exporter:9910' ]
+  scrape_interval: 15s
+  scrape_timeout: 10s
+
+# MySQL Exporter - métricas do banco de dados
+- job_name: 'mysql'
+  static_configs:
+  - targets: [ 'mysqld_exporter:9104' ]
+
+# OpenSIPS Exporter - métricas do proxy SIP
+- job_name: 'opensips'
+  static_configs:
+  - targets: [ 'opensips_exporter:9434' ]
   scrape_interval: 30s
+  scrape_timeout: 10s
+  metrics_path: /metrics
+
+# cAdvisor - métricas de containers
+- job_name: 'cadvisor'
+  static_configs:
+  - targets: [ 'cadvisor:8585' ]
+  scrape_interval: 30s
+  scrape_timeout: 15s
+  metric_relabel_configs:
+  # Remove métricas desnecessárias para reduzir carga
+  - source_labels: [ __name__ ]
+    regex: 'container_memory_failures_total|container_memory_mapped_file|container_memory_swap'
+    action: drop
+
+# Docker State Exporter - estado dos containers
+- job_name: 'docker_state'
+  static_configs:
+  - targets: [ 'docker_state_exporter:8080' ]
+  scrape_interval: 30s
+  scrape_timeout: 10s

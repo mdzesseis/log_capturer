@@ -1,16 +1,33 @@
 version: '3.8'
 
-volumes:
-  loki-data:
-  grafana-data:
-  prometheus-data:
-  alertmanager-data:
-  agent-logs:
-    driver_opts:
-      type: tmpfs
-      device: tmpfs
-      o: size=536870912  # 512 MB em bytes
-  test-logs:
+# volumes:
+#   loki-data:
+#     driver: local
+#     driver_opts:
+#       o: size=1.5GB
+#   grafana-data:
+#     driver: local
+#     driver_opts:
+#       o: size=1GB
+#   prometheus-data:
+#     driver: local
+#     driver_opts:
+#       o: size=1GB
+#   alertmanager-data:
+#   agent-logs:
+#     driver: local
+#     driver_opts:
+#       o: size=2GB  #2GB 536870912   512 MB em bytes
+#     # driver_opts:
+#     #   type: tmpfs
+#     #   device: tmpfs
+#     #   o: size=2147483648 #2GB 536870912   512 MB em bytes
+#   test-logs:
+#   # NOVO: Volume para métricas do Loki monitor
+#   loki-monitoring:
+#     driver_opts:
+#       type: local
+#       o: size=50MB
 
 services:
   log_capturer:
@@ -30,7 +47,10 @@ services:
       - ./file_pipeline.yml:/etc/log_capturer/files.yaml:ro
       # Novo: monta o pacote refatorado do host (dev-friendly)
       - ./refatoriong_new:/app/refatoriong_new:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     environment:
+      - TZ=America/Sao_Paulo
       - DEBUG_MODE=false
       - PYTHONUNBUFFERED=1
       # --- General & API Config ---
@@ -44,19 +64,20 @@ services:
       - DOCKER_LABEL_FILTER_ENABLED=false
       - DOCKER_LABEL_FILTER=monitoring
       # Limite de concorrência do ContainerMonitor (semaforo)
-      - DOCKER_MAX_CONCURRENT_TAILS=50
+      - DOCKER_MAX_CONCURRENT_TAILS=75
+      - SINK_PERSISTENCE_ENABLED=true
       # --- Task Management ---
       - TASK_RESTART_ENABLED=true
       - TASK_MAX_RESTART_COUNT=1000
       - TASK_RESTART_BACKOFF_BASE=2
-      - TASK_HEALTH_CHECK_INTERVAL=240
-      - CIRCUIT_BREAKER_ENABLED=true
+      - TASK_HEALTH_CHECK_INTERVAL=60
+      - CIRCUIT_BREAKER_ENABLED=false
       - CIRCUIT_BREAKER_FAILURE_THRESHOLD=500
       - CIRCUIT_BREAKER_RECOVERY_TIMEOUT=510
       # --- Resource Optimization ---
       - HTTP_SESSION_POOL_SIZE=64
-      - HTTP_CONNECTION_TIMEOUT=240
-      - HTTP_REQUEST_TIMEOUT=240
+      - HTTP_CONNECTION_TIMEOUT=60
+      - HTTP_REQUEST_TIMEOUT=60
       - HTTP_CONNECTOR_LIMIT=256
       - HTTP_CONNECTOR_LIMIT_PER_HOST=64
       - BACKPRESSURE_THRESHOLD=0.9
@@ -67,7 +88,7 @@ services:
       - BUFFER_WRITE_BATCH_SIZE=1000
       - BUFFER_SYNC_INTERVAL=10.0
       - CLEANUP_INTERVAL=300
-      - CLEANUP_BATCH_SIZE=100
+      - CLEANUP_BATCH_SIZE=500
       - CLEANUP_AGE_THRESHOLD=3600
       # --- Enterprise Robustness ---
       - STRUCTURED_LOGGING_ENABLED=true
@@ -88,7 +109,7 @@ services:
       # --- Secrets Management ---
       - SECRETS_MANAGER=env
       # --- Robustez de timestamp ---
-      - TIMESTAMP_CLAMP_ENABLED=false
+      - TIMESTAMP_CLAMP_ENABLED=true
       - TIMESTAMP_MAX_PAST_AGE_SECONDS=10800
       - TIMESTAMP_MAX_FUTURE_AGE_SECONDS=60
       - TIMESTAMP_CLAMP_DLQ=true
@@ -102,11 +123,11 @@ services:
       ## Loki
       - LOKI_SINK_ENABLED=true
       - LOKI_URL=http://loki:3100/loki/api/v1/push
-      - LOKI_SINK_QUEUE_SIZE=1000
-      - LOKI_BATCH_SIZE=1000
-      - LOKI_BATCH_TIMEOUT=15.0
+      - LOKI_SINK_QUEUE_SIZE=5000
+      - LOKI_BATCH_SIZE=5000
+      - LOKI_BATCH_TIMEOUT=5.0
       - LOKI_BUFFER_DIR=/logs/loki_buffer
-      - LOKI_BUFFER_MAX_SIZE_MB=128
+      - LOKI_BUFFER_MAX_SIZE_MB=256
       ## Local File
       - LOCAL_SINK_ENABLED=true
       - LOCAL_SINK_RETENTION_DAYS=1
@@ -131,53 +152,112 @@ services:
   loki:
     image: grafana/loki:3.5.3
     container_name: loki
-    # network_mode: host
     command: -config.file=/etc/loki/local-config.yaml
     ports:
       - "3100:3100"
     volumes:
       - ./loki-config.yaml:/etc/loki/local-config.yaml:ro
       - loki-data:/loki
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     restart: unless-stopped
+    environment:
+      - TZ=America/Sao_Paulo
+      - LOKI_MAX_DATA_SIZE=5GB
+      - LOKI_CLEANUP_ENABLED=true
+      - LOKI_RETENTION_POLICY=size_and_time
     healthcheck:
-      test: wget --quiet --tries=1 --output-document=- http://localhost:3100/ready | grep -q -w ready || exit 1
-      interval: 5s
+      test: |
+        wget --quiet --tries=1 --output-document=- http://localhost:3100/ready | grep -q -w ready || exit 1
+      interval: 10s
       timeout: 15s
       retries: 35
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+        reservations:
+          memory: 512M
+          cpus: '0.25'
     labels:
       - 'monitoring=true'
+
+  # NOVO: Sidecar container para monitoramento do Loki
+  loki-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile.loki-monitor
+    container_name: loki-monitor
+    restart: unless-stopped
+    volumes:
+      - loki-data:/loki:ro  # Acesso read-only aos dados do Loki
+      - ./scripts:/scripts:ro
+      # CORRIGIDO: Usar volume nomeado em vez de bind mount do host
+      - loki-monitoring:/tmp/monitoring
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    environment:
+      - TZ=America/Sao_Paulo
+      - LOKI_DATA_DIR=/loki
+      - MAX_SIZE_GB=1
+      - CLEANUP_THRESHOLD_PERCENT=80
+      - CHECK_INTERVAL=300  # 5 minutos
+      - LOKI_API_URL=http://loki:3100
+      - METRICS_OUTPUT_DIR=/tmp/monitoring
+      - METRICS_PORT=9091  
+    ports:
+      - "9091:9091"
+    depends_on:
+      loki:
+        condition: service_healthy
+    labels:
+      - 'monitoring=true'
+
   prometheus:
     image: prom/prometheus:v2.46.0
     container_name: prometheus
     # network_mode: host
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=2d'
+      - '--storage.tsdb.retention.size=1GB'
+      - '--storage.tsdb.wal-compression'
     ports:
       - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./rules.yml:/etc/prometheus/rules.yml:ro
+      # - ./rules.yml:/etc/prometheus/rules.yml:ro
       - prometheus-data:/prometheus
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     restart: unless-stopped
     depends_on:
       - log_capturer
-      - alertmanager
+      # - alertmanager
     labels:
       - 'monitoring=true'
+    environment:
+      - TZ=America/Sao_Paulo
 
-  alertmanager:
-    image: prom/alertmanager:v0.25.0
-    container_name: alertmanager
-    command:
-      - '--config.file=/etc/alertmanager/config.yml'
-    ports:
-      - "9093:9093"
-    volumes:
-      - ./config.yml:/etc/alertmanager/config.yml:ro
-      - alertmanager-data:/alertmanager
-    labels:
-      - 'monitoring=true'
-    restart: unless-stopped
+
+  # alertmanager:
+  #   image: prom/alertmanager:v0.25.0
+  #   container_name: alertmanager
+  #   command:
+  #     - '--config.file=/etc/alertmanager/config.yml'
+  #   ports:
+    #   - "9093:9093"
+    # volumes:
+    #   - ./config.yml:/etc/alertmanager/config.yml:ro
+    #   - alertmanager-data:/alertmanager
+    #   - /etc/localtime:/etc/localtime:ro
+    #   - /etc/timezone:/etc/timezone:ro
+    # labels:
+    #   - 'monitoring=true'
+    # restart: unless-stopped
+    # environment:
+    #   - TZ=America/Sao_Paulo
 
   grafana:
     image: grafana/grafana:12.1.1
@@ -188,7 +268,10 @@ services:
     volumes:
       - grafana-data:/var/lib/grafana
       - ./provisioning:/etc/grafana/provisioning
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     environment:
+      - TZ=America/Sao_Paulo
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
     restart: unless-stopped
@@ -205,6 +288,11 @@ services:
     command: sh -c 'while true; do echo "$(date +%Y-%m-%dT%H:%M:%S) [DOCKER] level=INFO app=docker_gen service=payment transaction_id=$RANDOM event=processed"; sleep 2; done'
     labels:
       - 'monitoring=true'
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    environment:
+      - TZ=America/Sao_Paulo
 
   log_generator_file:
     image: busybox:1.36
@@ -213,8 +301,12 @@ services:
     command: sh -c 'while true; do echo "$(date +%Y-%m-%dT%H:%M:%S) [FILE] level=WARN app=file_gen service=auth user=system event=failed_login" >> /var/log/test/test_app.log; sleep 3; done'
     volumes:
       - test-logs:/var/log/test
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     labels:
       - 'monitoring=true'
+    environment:
+      - TZ=America/Sao_Paulo
 
   # Elasticsearch (serviço comentado)
   # elasticsearch:
@@ -247,3 +339,172 @@ services:
   #   ports:
   #     - "8000:8000"
   #     - "8088:8088"
+
+  # MySQL Exporter
+  mysqld_exporter:
+    image: prom/mysqld-exporter:v0.17.2
+    container_name: mysqld_exporter
+    # network_mode: host
+    restart: unless-stopped
+    ports:
+      - "9104:9104"
+    command:
+     - --mysqld.username=root:root
+     - --mysqld.address=172.72.0.3:3306
+#    environment:
+#      - DATA_SOURCE_NAME=exporter:#pulseintegra#@(host.docker.internal:3306)/
+    networks:
+      default:
+      softswitch-br:
+        ipv4_address: 172.72.0.15
+    labels:
+      - 'monitoring=true'
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    environment:
+      - TZ=America/Sao_Paulo
+
+  # OpenSIPS Exporter
+  opensips_exporter:
+    image: opensips_exporter:2.0.5
+    container_name: opensips_exporter
+    # network_mode: host
+    restart: unless-stopped
+    ports:
+      - "9434:9434"
+    command:
+      - "-protocol=mi_http"
+      - "-http_address=http://172.72.0.2:8888/mi/"
+   # environment:
+   #   - OPENSIPS_PROTOCOL=mi_http
+   #   - OPENSIPS_HTTP_ADDRESS=http://127.0.0.1:8000/ssw/
+   #   - OPENSIPS_EXPORTER_ADDR=:9434
+   #   - OPENSIPS_EXPORTER_PATH=/metrics
+    networks:
+      default:
+      softswitch-br:
+        ipv4_address: 172.72.0.18
+    labels:
+      - 'monitoring=true'
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    environment:
+      - TZ=America/Sao_Paulo 
+
+  # Blackbox Exporter
+  # blackbox_exporter:
+  #   image: prom/blackbox-exporter:latest
+  #   container_name: blackbox_exporter
+  #   network_mode: host
+  #   restart: unless-stopped
+  #   #ports:
+  #   #  - "9115:9115"
+  #   volumes:
+  #     - ./blackbox:/config
+  #   command:
+  #     - '--config.file=/config/blackbox.yml'
+  #   # networks:
+  #   #   - monitoring
+    # labels:
+    #   - 'monitoring=true'
+
+  # cAdvisor - Otimizado para melhor performance
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: cadvisor
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    # network_mode: host
+    privileged: true
+    restart: unless-stopped
+    ports:
+      - "8585:8585"
+    command:
+      - '--port=8585'
+      - '--housekeeping_interval=30s'  # Reduzido de 15s para 30s
+      - '--max_housekeeping_interval=35s'
+      - '--docker_only=true'  # Apenas containers Docker
+      - '--store_container_labels=false'  # Reduz uso de memória
+      - '--whitelisted_container_labels=name,com.docker.compose.service'
+      - '--disable_metrics=percpu,sched,tcp,udp,advtcp,hugetlb,referenced_memory,cpu_topology,resctrl'
+      - '--docker_env_metadata_whitelist=PATH,HOSTNAME'
+      - '--enable_load_reader=false'
+      - '--event_storage_age_limit=default=0'
+      - '--event_storage_event_limit=default=0'
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    # networks:
+    #   - monitoring
+    labels:
+      - 'monitoring=true'
+    environment:
+      - TZ=America/Sao_Paulo
+
+  # Docker State Exporter
+  docker_state_exporter:
+    image: karugaru/docker_state_exporter:latest
+    container_name: docker_state_exporter
+    # network_mode: bridge
+    restart: unless-stopped
+    ports:
+      - "9323:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    # networks:
+    #   - monitoring
+    labels:
+      - 'monitoring=true'
+    environment:
+      - TZ=America/Sao_Paulo
+
+  # Node Exporter
+  node_exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: node_exporter
+    # network_mode: host
+    restart: unless-stopped
+    ports:
+      - "9910:9910"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      # - '--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc|run)($$|/)'
+      - '--collector.filesystem.ignored-mount-points=^/(proc|dev|etc|run)($$|/)'
+      - '--collector.filesystem.ignored-fs-types=tmpfs,overlay,proc,sysfs,cgroup2'
+      # - '--collector.processes'
+      # - '--collector.systemd'
+      - '--web.listen-address=:9910'
+      - '--no-collector.wifi'
+      - '--no-collector.hwmon'
+    # networks:
+    #   - monitoring
+    labels:
+      - 'monitoring=true'
+    environment:
+      - TZ=America/Sao_Paulo
+
+networks: 
+  softswitch-br:
+    external: true

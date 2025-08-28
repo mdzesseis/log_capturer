@@ -216,6 +216,70 @@ class LogCapturerApp:
     async def handle_validate_config(self, request):
         validator = ConfigValidator(); valid = validator.validate_all()
         return web.json_response({"valid": valid, "errors": validator.errors, "warnings": validator.warnings})
+    async def handle_loki_storage_metrics(self, request):
+        """Endpoint para expor métricas de armazenamento do Loki."""
+        try:
+            # Tentar múltiplos caminhos para as métricas
+            possible_paths = [
+                Path("/tmp/monitoring/loki_metrics.prom"),
+                Path("/tmp/loki_metrics/loki_metrics.prom"),
+                Path("/var/lib/docker/volumes/ssw-monitoring-stack-new-project_loki-monitoring/_data/loki_metrics.prom"),
+                # Verificar volume nomeado
+                Path("/tmp/loki-monitoring/loki_metrics.prom"),
+                # Buscar no diretório de monitoramento
+                *list(Path("/tmp/monitoring").glob("*loki*.prom")),
+                # Busca em volumes do Docker
+                *list(Path("/var/lib/docker/volumes").glob("*loki*/_data/*.prom")),
+                # Volume com hífen ou underscore
+                Path("/var/lib/docker/volumes/loki-monitoring/_data/loki_metrics.prom"),
+                Path("/var/lib/docker/volumes/loki_monitoring/_data/loki_metrics.prom")
+            ]
+            
+            content = None
+            found_path = None
+            
+            # Primeiro tenta os caminhos específicos
+            for metrics_file in possible_paths:
+                try:
+                    if metrics_file.exists():
+                        content = metrics_file.read_text()
+                        found_path = metrics_file
+                        break
+                except Exception:
+                    continue
+            
+            # Se não encontrou, tenta busca mais ampla
+            if content is None:
+                try:
+                    # Busca recursiva em /tmp
+                    for metrics_file in Path("/tmp").rglob("*loki*.prom"):
+                        try:
+                            if metrics_file.exists():
+                                content = metrics_file.read_text()
+                                found_path = metrics_file
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+                    
+            if content:
+                self.logger.info(f"Métricas do Loki encontradas em {found_path}")
+                return web.Response(text=content, content_type="text/plain")
+            else:
+                # Métricas básicas se arquivo não existir
+                self.logger.warning("Arquivo de métricas do Loki não encontrado")
+                return web.Response(
+                    text="# Loki storage metrics not available\nloki_metrics_available 0\n",
+                    content_type="text/plain"
+                )
+        except Exception as e:
+            self.logger.error(f"Erro ao ler métricas do Loki: {str(e)}")
+            return web.Response(
+                text=f"# Error reading Loki metrics: {str(e)}\nloki_metrics_error 1\n",
+                content_type="text/plain"
+            )
+
     async def _load_file_config(self):
         """
         Carrega arquivos do YAML de configuração e inicia monitoramento se habilitado.
@@ -284,6 +348,15 @@ class LogCapturerApp:
         api_app.router.add_get("/health/detailed", self.handle_detailed_health)
         api_app.router.add_get("/config/validation", self.handle_config_validation)
         api_app.router.add_post("/config/validate", self.handle_validate_config)
+        # NOVO: Endpoint para métricas de storage do Loki
+        api_app.router.add_get("/loki-storage-metrics", self.handle_loki_storage_metrics)
+        
+        # CORRIGIDO: Criar uma instância de RobustHealthCheck para acessar os métodos de administração de tarefas
+        health_checker = RobustHealthCheck(self)
+        # CORRIGIDO: Utilizar os métodos da instância de RobustHealthCheck
+        api_app.router.add_get("/admin/orphaned-tasks", health_checker.handle_list_orphaned_tasks)
+        api_app.router.add_post("/admin/cleanup-orphaned-tasks", health_checker.handle_cleanup_orphaned_tasks)
+
         self.api_runner = web.AppRunner(api_app)
         await self.api_runner.setup()
         site = web.TCPSite(self.api_runner, '0.0.0.0', API_PORT)
@@ -377,3 +450,127 @@ class RobustHealthCheck:
         if any(s in ("error", "unhealthy") for s in vals): return "unhealthy"
         if any(s == "degraded" for s in vals): return "degraded"
         return "healthy"
+
+    async def handle_cleanup_orphaned_tasks(self, request):
+        """Remove tasks órfãs manualmente com verificações de segurança"""
+        try:
+            removed_count = 0
+            skipped_count = 0
+            orphaned_tasks = []
+            active_containers_found = []
+            
+            # Obter URL do Docker da configuração
+            from .config import DOCKER_SOCKET_URL
+            
+            # Obter lista de containers ativos do Docker
+            async with self.http_session_pool.get_session() as session:
+                async with session.get(f"{DOCKER_SOCKET_URL}/containers/json?all=true") as resp:
+                    if resp.status == 200:
+                        all_containers = await resp.json()
+                        # Incluir containers parados também (podem ser restarted)
+                        active_ids = {c['Id'][:12] for c in all_containers}
+                    else:
+                        return web.json_response({"success": False, "error": "Erro ao conectar com Docker API"}, status=500)
+            
+            # Identificar tasks órfãs com verificação dupla
+            for task_name in list(self.task_manager.health_status.keys()):
+                if task_name.startswith("container_"):
+                    container_id = task_name.replace("container_", "")
+                    
+                    # Verificação 1: Lista de containers
+                    if container_id in active_ids:
+                        active_containers_found.append({
+                            "task_name": task_name,
+                            "container_id": container_id,
+                            "reason": "Container encontrado na lista do Docker"
+                        })
+                        skipped_count += 1
+                        continue
+                    
+                    # Verificação 2: API individual do container
+                    container_active = await self.task_manager._is_container_active(container_id)
+                    
+                    if container_active:
+                        active_containers_found.append({
+                            "task_name": task_name,
+                            "container_id": container_id,
+                            "reason": "Container confirmado ativo via API"
+                        })
+                        skipped_count += 1
+                        continue
+                    
+                    # Container confirmadamente órfão
+                    orphaned_tasks.append(task_name)
+            
+            # Remover apenas tasks confirmadamente órfãs
+            for task_name in orphaned_tasks:
+                await self.task_manager._remove_task_permanently(task_name)
+                removed_count += 1
+            
+            self.logger.info("Limpeza manual concluída", removed_tasks=removed_count, skipped_tasks=skipped_count)
+            
+            return web.json_response({
+                "success": True,
+                "removed_tasks": removed_count,
+                "skipped_tasks": skipped_count,
+                "orphaned_tasks": orphaned_tasks,
+                "active_containers_preserved": active_containers_found,
+                "message": f"Removidas {removed_count} tasks órfãs, preservadas {skipped_count} tasks de containers ativos"
+            })
+            
+        except Exception as e:
+            self.logger.error("Erro na limpeza de tasks órfãs", error=str(e))
+            return web.json_response({"success": False, "error": str(e)}, status=500)
+
+    async def handle_list_orphaned_tasks(self, request):
+        """Lista tasks órfãs com verificações de segurança"""
+        try:
+            # Obter URL do Docker da configuração
+            from .config import DOCKER_SOCKET_URL
+            
+            # Obter containers ativos (incluindo parados)
+            async with self.http_session_pool.get_session() as session:
+                async with session.get(f"{DOCKER_SOCKET_URL}/containers/json?all=true") as resp:
+                    if resp.status == 200:
+                        all_containers = await resp.json()
+                        active_ids = {c['Id'][:12] for c in all_containers}
+                    else:
+                        return web.json_response({"success": False, "error": "Erro ao conectar com Docker API"}, status=500)
+            
+            # Classificar tasks
+            orphaned_tasks = []
+            active_tasks = []
+            
+            for task_name in self.task_manager.health_status.keys():
+                if task_name.startswith("container_"):
+                    container_id = task_name.replace("container_", "")
+                    task_status = self.task_manager.get_task_status().get(task_name, {})
+                    
+                    # Verificação dupla
+                    in_docker_list = container_id in active_ids
+                    container_active = await self.task_manager._is_container_active(container_id)
+                    
+                    task_info = {
+                        "task_name": task_name,
+                        "container_id": container_id,
+                        "status": task_status,
+                        "in_docker_list": in_docker_list,
+                        "container_active": container_active
+                    }
+                    
+                    if container_active or in_docker_list:
+                        active_tasks.append(task_info)
+                    else:
+                        orphaned_tasks.append(task_info)
+            
+            return web.json_response({
+                "success": True,
+                "orphaned_count": len(orphaned_tasks),
+                "active_count": len(active_tasks),
+                "orphaned_tasks": orphaned_tasks,
+                "active_tasks": active_tasks
+            })
+            
+        except Exception as e:
+            self.logger.error("Erro ao listar tasks órfãs", error=str(e))
+            return web.json_response({"success": False, "error": str(e)}, status=500)
